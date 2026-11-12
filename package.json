@@ -1,0 +1,27 @@
+{
+  "name": "motion-studio",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "api": "node --env-file-if-exists=.env server/index.js",
+    "build": "vite build",
+    "start": "node --env-file-if-exists=.env server/index.js",
+    "test": "node --test server/*.test.js"
+  },
+  "dependencies": {
+    "express": "5.1.0",
+    "lucide-react": "0.468.0",
+    "multer": "2.5.0",
+    "react": "19.1.1",
+    "react-dom": "19.1.1",
+    "sharp": "0.35.5"
+  },
+  "devDependencies": {
+    "vite": "7.3.8"
+  },
+  "engines": {
+    "node": ">=22.16"
+  }
+}
