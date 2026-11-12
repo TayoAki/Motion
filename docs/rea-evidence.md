@@ -36,7 +36,7 @@ REA's application and semantic coverage are **partial**. Twenty-three inventorie
 | Asynchronous progress and cancellation | Serialized FFmpeg worker, real progress, cancellation and credit refunds |
 | Tutorial's scene review and replacement | Scene editor, visual replacement, saved changes, re-render and download |
 | Credit/history and account concepts | Local test-credit ledger, private accounts, hashed sessions and API keys |
-| Checkout and YouTube candidates | Explicit unconnected-service screens; no fake payment/publishing success |
+| Checkout and YouTube candidates | Configuration-gated Stripe and Google flows; signed invoices, OAuth, and resumable publishing rather than simulated success |
 
 The implementation was written independently with ordinary coding tools after the REA investigation. It does not copy GoMotion's client code, access its private endpoints, or assert that GoMotion uses this renderer or stack.
 
@@ -45,3 +45,5 @@ REA's `list-browser-targets` and passive `inspect-web-page` were also run on the
 ## Verification boundary
 
 Automated tests verify this application's backend and real output files. They do not verify the original GoMotion product. Paid provider calls, real payment flows, YouTube publishing, email delivery, and full UI-driven acceptance testing were not performed.
+
+The follow-up implementation adds provider-backed verification/recovery, subscriptions, YouTube publishing, recurring Autopilot series, and an application MCP endpoint. Isolated HTTP provider mocks exercise these paths, including real local rendering and recovery after lost responses; they do not establish live provider approval or activation.

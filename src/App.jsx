@@ -1,5 +1,15 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
+  EmailAction,
+  ForgotPassword,
+  AccountSecurity,
+  BillingPanel,
+  PlanPicker,
+  PublishStudio,
+  PaymentSummary,
+  IntegrationStatus,
+} from "./Integrations.jsx";
+import {
   ArrowDownToLine,
   ArrowLeft,
   ArrowRight,
@@ -130,6 +140,8 @@ const initialForm = {
   musicId: null,
 };
 const iconSize = 18;
+const currentRoute = () =>
+  window.location.hash.replace(/^#\/?/, "").split("?")[0] || "create";
 async function api(url, options = {}) {
   const response = await fetch(`/api${url}`, {
     credentials: "same-origin",
@@ -257,13 +269,12 @@ function Modal({ title, children, close, wide = false }) {
 }
 
 export default function App() {
-  const [route, setRoute] = useState(
-    window.location.hash.replace(/^#\/?/, "") || "create",
-  );
+  const [route, setRoute] = useState(currentRoute());
   const [user, setUser] = useState(null),
     [authReady, setAuthReady] = useState(false);
   const [authMode, setAuthMode] = useState(null),
     [modal, setModal] = useState(null);
+  const [emailDelivery, setEmailDelivery] = useState(null);
   const [projects, setProjects] = useState([]),
     [health, setHealth] = useState({});
   const [toast, setToast] = useState(null),
@@ -301,7 +312,7 @@ export default function App() {
   };
   useEffect(() => {
     const listener = () => {
-      setRoute(window.location.hash.replace(/^#\/?/, "") || "create");
+      setRoute(currentRoute());
       setMobile(false);
       setError("");
       window.scrollTo(0, 0);
@@ -449,7 +460,7 @@ export default function App() {
       projects: "My projects",
       scripts: "Script studio",
       thumbnails: "Thumbnail studio",
-      autopilot: "YouTube autopilot",
+      autopilot: "YouTube publishing",
       api: "API & integrations",
       history: "Credit history",
       settings: "Account settings",
@@ -511,7 +522,7 @@ export default function App() {
               {[
                 ["scripts", FileText, "Script studio"],
                 ["thumbnails", Image, "Thumbnails"],
-                ["autopilot", Youtube, "Autopilot"],
+                ["autopilot", Youtube, "Publish & schedule"],
                 ["api", Code2, "API & integrations"],
               ].map(([r, Icon, label]) => (
                 <a
@@ -521,7 +532,7 @@ export default function App() {
                 >
                   <Icon size={iconSize} />
                   {label}
-                  {r === "autopilot" && <span className="new-tag">SOON</span>}
+                  {r === "autopilot" && <span className="new-tag">NEW</span>}
                 </a>
               ))}
             </nav>
@@ -1252,7 +1263,25 @@ export default function App() {
                 />
               )}
               {route === "thumbnails" && <ThumbnailStudio notify={notify} />}
-              {route === "autopilot" && <Autopilot />}
+              {route === "autopilot" && (
+                <PublishStudio
+                  user={user}
+                  projects={projects}
+                  requireUser={requireUser}
+                  notify={notify}
+                />
+              )}
+              {(route.startsWith("verify/") || route.startsWith("reset/")) && (
+                <EmailAction
+                  token={route.split("/")[1]}
+                  reset={route.startsWith("reset/")}
+                  refresh={refresh}
+                  signin={() => {
+                    navigate("settings");
+                    setAuthMode("login");
+                  }}
+                />
+              )}
               {route === "api" && (
                 <ApiStudio
                   user={user}
@@ -1288,7 +1317,9 @@ export default function App() {
                 "history",
                 "settings",
               ].includes(route) &&
-                !route.startsWith("project/") && (
+                !route.startsWith("project/") &&
+                !route.startsWith("verify/") &&
+                !route.startsWith("reset/") && (
                   <EmptyState
                     icon={Film}
                     title="Let’s get you back to creating"
@@ -1314,14 +1345,42 @@ export default function App() {
           mode={authMode}
           setMode={setAuthMode}
           close={() => setAuthMode(null)}
-          onSuccess={async () => {
+          onSuccess={async (result) => {
             await refresh();
             setAuthMode(null);
+            setEmailDelivery(result.delivery || null);
             notify("You’re in. Let’s make something great.");
           }}
         />
       )}
-      {modal === "plans" && <Plans close={() => setModal(null)} />}
+      {emailDelivery && (
+        <Modal title="Check your inbox" close={() => setEmailDelivery(null)}>
+          <p>{emailDelivery.message}</p>
+          {emailDelivery.previewURL && (
+            <a
+              className="button primary"
+              href={emailDelivery.previewURL}
+              onClick={() => setEmailDelivery(null)}
+            >
+              Open development email preview
+            </a>
+          )}
+        </Modal>
+      )}
+      {modal === "plans" && (
+        <Modal
+          title="Room for bigger stories."
+          close={() => setModal(null)}
+          wide
+        >
+          <PlanPicker
+            user={user}
+            close={() => setModal(null)}
+            signin={() => setAuthMode("login")}
+            notify={notify}
+          />
+        </Modal>
+      )}
       {modal === "tutorial" && (
         <Modal title="Your idea → your next video" close={() => setModal(null)}>
           <div className="tutorial-cover">
@@ -1452,17 +1511,23 @@ function Auth({ mode, setMode, close, onSuccess }) {
     setBusy(true);
     setError("");
     try {
-      await api(`/auth/${signup ? "signup" : "login"}`, {
+      const result = await api(`/auth/${signup ? "signup" : "login"}`, {
         method: "POST",
         body: { email, password, name },
       });
-      await onSuccess();
+      await onSuccess(result);
     } catch (e) {
       setError(e.message);
     } finally {
       setBusy(false);
     }
   }
+  if (mode === "forgot")
+    return (
+      <Modal title="Reset your password" close={close}>
+        <ForgotPassword close={() => setMode("login")} />
+      </Modal>
+    );
   return (
     <Modal
       title={
@@ -1528,6 +1593,11 @@ function Auth({ mode, setMode, close, onSuccess }) {
           <ArrowRight size={17} />
         </button>
       </form>
+      {!signup && (
+        <button className="text-button" onClick={() => setMode("forgot")}>
+          Forgot your password?
+        </button>
+      )}
       <p className="auth-switch">
         {signup ? "Already part of the story?" : "New around here?"}{" "}
         <button
@@ -1540,8 +1610,8 @@ function Auth({ mode, setMode, close, onSuccess }) {
         </button>
       </p>
       <p className="footnote center">
-        Local accounts use secure password hashing and private sessions. Email
-        delivery is not configured.
+        Passwords are hashed securely. Recovery links are single-use and expire
+        after one hour.
       </p>
     </Modal>
   );
@@ -2194,13 +2264,11 @@ function Editor({ id, user, requireUser, refresh, notify }) {
               <div className="publish-note">
                 <Youtube size={21} />
                 <strong>Next stop: your audience.</strong>
-                <p>Download your video, then upload it to your channel.</p>
-                <a
-                  href="https://studio.youtube.com"
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  Open YouTube Studio <ArrowRight size={14} />
+                <p>
+                  Upload this export to your channel or schedule its release.
+                </p>
+                <a href="#autopilot">
+                  Publish & schedule <ArrowRight size={14} />
                 </a>
               </div>
             )}
@@ -2563,54 +2631,6 @@ function ThumbnailStudio({ notify }) {
     </>
   );
 }
-function Autopilot() {
-  return (
-    <>
-      <PageIntro
-        eyebrow="MORE TIME FOR WHAT’S NEXT"
-        title="Your channel, in a rhythm"
-        description="A place for your content calendar — and eventually, a little less busywork."
-      />
-      <section className="autopilot-hero panel">
-        <span className="coming-soon">
-          <span />
-          INTEGRATION REQUIRED
-        </span>
-        <div className="youtube-orbit">
-          <Youtube size={49} />
-        </div>
-        <h2>Create here. Connect your audience.</h2>
-        <p>
-          YouTube publishing needs your own Google OAuth application, approved
-          permissions, and a connected channel. This studio doesn’t upload or
-          schedule videos yet.
-        </p>
-        <a
-          className="button primary"
-          href="https://developers.google.com/youtube/v3/guides/uploading_a_video"
-          target="_blank"
-          rel="noreferrer"
-        >
-          YouTube integration guide
-          <ArrowRight size={17} />
-        </a>
-        <div className="autopilot-features">
-          {[
-            [Film, "Create a video", "Ready in your studio"],
-            [ArrowDownToLine, "Download your MP4", "Available after rendering"],
-            [Youtube, "Publish to YouTube", "Upload manually for now"],
-          ].map(([Icon, t, d]) => (
-            <div key={t}>
-              <Icon size={21} />
-              <strong>{t}</strong>
-              <span>{d}</span>
-            </div>
-          ))}
-        </div>
-      </section>
-    </>
-  );
-}
 function ApiStudio({ user, requireUser, notify }) {
   const [keys, setKeys] = useState([]),
     [newKey, setNewKey] = useState(""),
@@ -2660,7 +2680,8 @@ function ApiStudio({ user, requireUser, notify }) {
           </div>
           <h2>A key to your workspace</h2>
           <p className="section-description">
-            Keys can access your projects and local credits. Keep them private.
+            Keys can access your projects and generation credits. Keep them
+            private.
           </p>
           <label className="field-label" htmlFor="key-label">
             Key name
@@ -2739,10 +2760,14 @@ function ApiStudio({ user, requireUser, notify }) {
             ))}
           </div>
           <p className="footnote">
-            This implementation has REST access. An MCP adapter is not included.
+            MCP is available at <code>{window.location.origin}/api/mcp</code>{" "}
+            using stateless Streamable HTTP and the same bearer API key. It
+            supports project creation, rendering, status, cancellation, exports,
+            and credit history.
           </p>
         </section>
       </div>
+      {user && <IntegrationStatus notify={notify} />}
     </>
   );
 }
@@ -2777,7 +2802,7 @@ function History({ user, signin }) {
                 <Zap size={23} />
               </span>
               <div>
-                <span>Available local credits</span>
+                <span>Available credits</span>
                 <strong>{user.credits}</strong>
               </div>
             </div>
@@ -2802,9 +2827,7 @@ function History({ user, signin }) {
               </span>
               <div>
                 <span>Real charges made</span>
-                <strong>
-                  $0<small>Local mode</small>
-                </strong>
+                <PaymentSummary user={user} />
               </div>
             </div>
           </div>
@@ -2872,8 +2895,9 @@ function History({ user, signin }) {
             </div>
           </section>
           <p className="footnote">
-            Credits here are a local test allowance. They do not represent a
-            paid subscription or a charge.
+            Starter credits are free. Subscription allowances appear only after
+            a signed Stripe paid-invoice event. Payment receipts are available
+            in Account settings.
           </p>
         </>
       )}
@@ -2940,36 +2964,13 @@ function Settings({ user, refresh, signin, notify, showPlans, onSignedOut }) {
                 Email address
                 <input value={user.email} disabled />
               </label>
-              <p className="footnote">
-                Email changes and password recovery need an email provider,
-                which is not connected.
-              </p>
               <button className="button primary" disabled={busy}>
                 {busy ? <Spinner /> : <Check size={16} />}Save changes
               </button>
             </form>
           </section>
-          <section className="panel">
-            <span className="soft-pill">YOUR PLAN</span>
-            <h2>Local studio</h2>
-            <p className="modal-description">
-              300 starting test credits. A real rendering engine. Room to
-              explore.
-            </p>
-            <div className="setting-balance">
-              <Zap size={20} />
-              <strong>{user.credits}</strong>
-              <span>credits remaining</span>
-            </div>
-            <button className="button secondary" onClick={showPlans}>
-              Compare future plans
-              <ArrowRight size={16} />
-            </button>
-            <div className="info-note">
-              Payments and subscriptions are not connected. No real billing
-              occurs.
-            </div>
-          </section>
+          <BillingPanel user={user} showPlans={showPlans} notify={notify} />
+          <AccountSecurity user={user} refresh={refresh} notify={notify} />
           <section className="panel signout-panel">
             <div>
               <h2>Until the next story.</h2>
@@ -2983,89 +2984,6 @@ function Settings({ user, refresh, signin, notify, showPlans, onSignedOut }) {
         </div>
       )}
     </>
-  );
-}
-function Plans({ close }) {
-  const [yearly, setYearly] = useState(false);
-  return (
-    <Modal title="Room for bigger stories." close={close} wide>
-      <p className="modal-description">
-        Reference pricing from the mapped GoMotion journey. Checkout is not
-        connected in this local implementation.
-      </p>
-      <div className="billing-toggle">
-        <span>Monthly</span>
-        <Toggle checked={yearly} onChange={setYearly} label="Yearly billing" />
-        <span>
-          Yearly <b>2 months free</b>
-        </span>
-      </div>
-      <div className="plan-grid">
-        {[
-          {
-            title: "Creator",
-            price: 27,
-            credits: 1440,
-            desc: "For your next chapter",
-            features: [
-              "Narrated video generation",
-              "Scene editing & captions",
-              "1080p MP4 exports",
-            ],
-          },
-          {
-            title: "Studio",
-            price: 59,
-            credits: 3600,
-            desc: "Find your creative rhythm",
-            features: [
-              "Everything in Creator",
-              "More room to experiment",
-              "A bigger monthly allowance",
-            ],
-          },
-          {
-            title: "Agency",
-            price: 107,
-            credits: 7200,
-            desc: "More ideas. More possibilities.",
-            features: [
-              "Everything in Studio",
-              "Higher-volume creation",
-              "Room for a full content calendar",
-            ],
-          },
-        ].map((p, i) => (
-          <div className={`plan ${i === 1 ? "featured" : ""}`} key={p.title}>
-            {i === 1 && <span className="plan-popular">ROOM TO GROW</span>}
-            <h3>{p.title}</h3>
-            <p>{p.desc}</p>
-            <div className="plan-price">
-              ${yearly ? ((p.price * 10) / 12).toFixed(2) : p.price}
-              <span>/ month</span>
-            </div>
-            <strong className="plan-credits">
-              <Zap size={15} />
-              {p.credits.toLocaleString()} credits / month
-            </strong>
-            <button className="button secondary full" disabled>
-              Checkout not connected
-            </button>
-            {p.features.map((f) => (
-              <span className="plan-feature" key={f}>
-                <Check size={14} />
-                {f}
-              </span>
-            ))}
-          </div>
-        ))}
-      </div>
-      <div className="info-note">
-        <CreditCard size={17} />
-        Your current workspace uses local test credits. To launch paid plans,
-        connect Stripe and implement webhooks and subscription entitlements.
-      </div>
-    </Modal>
   );
 }
 function Landing({ enter, signup }) {

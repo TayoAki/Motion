@@ -52,14 +52,12 @@ export function validateProject(input) {
       ),
     ),
     scenes: Array.isArray(input.scenes)
-      ? input.scenes
-          .slice(0, 40)
-          .map((s) => ({
-            text: String(s.text || "").slice(0, 1200),
-            background: BACKGROUNDS.includes(s.background)
-              ? s.background
-              : "mountains",
-          }))
+      ? input.scenes.slice(0, 40).map((s) => ({
+          text: String(s.text || "").slice(0, 1200),
+          background: BACKGROUNDS.includes(s.background)
+            ? s.background
+            : "mountains",
+        }))
       : [],
   };
 }
