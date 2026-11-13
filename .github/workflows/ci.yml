@@ -18,6 +18,7 @@ jobs:
       - name: Install render dependencies
         run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
       - run: npm ci
+      - run: npm run format:check
       - run: npm test
       - run: npm run build
       - run: npm audit --omit=dev

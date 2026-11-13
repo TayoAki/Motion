@@ -15,6 +15,14 @@ import {
   VOICES,
 } from "./domain.js";
 import { renderVideo, probe, command } from "./render.js";
+import { installEmail } from "./email.js";
+import { installBilling } from "./billing.js";
+import { installYouTube } from "./youtube.js";
+import { HttpError } from "./providers.js";
+import { generateNarration } from "./script-service.js";
+import { installSeries } from "./series.js";
+import { installMCP } from "./mcp.js";
+import { installReadiness } from "./readiness.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(here, "..");
@@ -45,7 +53,10 @@ app.use((req, res, next) => {
     return res.status(403).json({ error: "Request origin is not allowed." });
   next();
 });
-app.use(express.json({ limit: "200kb" }));
+const jsonBody = express.json({ limit: "200kb" });
+app.use((req, res, next) =>
+  req.path === "/api/billing/webhook" ? next() : jsonBody(req, res, next),
+);
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 const read = (row) => (row ? JSON.parse(row.data) : null);
 const find = (id, uid) =>
@@ -66,6 +77,7 @@ const publicUser = (u) => ({
   email: u.email,
   name: u.name,
   credits: u.credits,
+  emailVerified: !!u.email_verified,
 });
 const userById = (id) => db.prepare("SELECT * FROM users WHERE id=?").get(id);
 function credit(uid, pid, label, amount) {
@@ -143,13 +155,40 @@ function authRate(req, res, next) {
       .json({ error: "Too many attempts. Try again in 15 minutes." });
   next();
 }
+const emailService = installEmail({
+  app,
+  db,
+  auth,
+  authRate,
+  digest,
+  transaction,
+  session,
+});
+const billingService = installBilling({
+  app,
+  db,
+  auth,
+  transaction,
+  credit,
+  requireVerified: emailService.requireVerified,
+});
+const youtubeService = installYouTube({
+  app,
+  db,
+  auth,
+  digest,
+  root,
+  find,
+  requireVerified: emailService.requireVerified,
+});
 app.get("/api/health", (_req, res) =>
   res.json({
     ok: true,
     renderer: "ffmpeg",
     scriptAI: !!process.env.OPENROUTER_API_KEY,
-    billing: false,
-    youtube: false,
+    billing: billingService.configured,
+    youtube: youtubeService.configured,
+    email: emailService.status(),
     mode: "local-studio",
   }),
 );
@@ -218,7 +257,19 @@ app.post("/api/auth/signup", authRate, async (req, res) => {
       .json({ error: "An account already exists. Please log in." });
   }
   session(req, res, id);
-  res.status(201).json({ user: publicUser(userById(id)) });
+  req.user = userById(id);
+  let delivery;
+  if (emailService.status().configured || emailService.status().preview) {
+    try {
+      delivery = await emailService.sendVerification(req);
+    } catch {
+      delivery = {
+        message:
+          "Your account was created. Request a verification email from Account settings.",
+      };
+    }
+  }
+  res.status(201).json({ user: publicUser(req.user), delivery });
 });
 app.post("/api/auth/login", authRate, async (req, res) => {
   const u = db.prepare("SELECT * FROM users WHERE email=?").get(
@@ -266,14 +317,14 @@ app.post("/api/quote", auth, (req, res) => {
   const audio = ownedUpload(input.audioId, req.user.id, "narration");
   res.json(quote(input.script, audio?.duration));
 });
-app.post("/api/projects", auth, (req, res) => {
-  const input = validateProject(req.body);
-  ownedUpload(input.audioId, req.user.id, "narration");
-  ownedUpload(input.musicId, req.user.id, "music");
-  const p = save({
+function createProject(uid, input) {
+  input = validateProject(input);
+  ownedUpload(input.audioId, uid, "narration");
+  ownedUpload(input.musicId, uid, "music");
+  return save({
     ...input,
     id: randomUUID(),
-    userId: req.user.id,
+    userId: uid,
     created: new Date().toISOString(),
     status: "draft",
     progress: 0,
@@ -282,8 +333,10 @@ app.post("/api/projects", auth, (req, res) => {
       : makeScenes(input.script, input.background),
     exports: 0,
   });
-  res.status(201).json(p);
-});
+}
+app.post("/api/projects", auth, (req, res) =>
+  res.status(201).json(createProject(req.user.id, req.body)),
+);
 app.patch("/api/projects/:id", auth, (req, res) => {
   const p = find(req.params.id, req.user.id);
   if (!p) return res.status(404).json({ error: "Project not found." });
@@ -393,26 +446,29 @@ async function drain() {
     processing = false;
   }
 }
-app.post("/api/projects/:id/render", auth, (req, res) => {
-  let p = find(req.params.id, req.user.id);
-  if (!p) return res.status(404).json({ error: "Project not found." });
+function enqueueRender(uid, id) {
+  const user = userById(uid);
+  if (process.env.REQUIRE_EMAIL_VERIFICATION === "1" && !user.email_verified)
+    throw new HttpError(403, "Verify your email before rendering.");
+  let p = find(id, uid);
+  if (!p) throw new HttpError(404, "Project not found.");
   if (["queued", "running"].includes(p.status))
-    return res
-      .status(409)
-      .json({ error: "This project is already rendering." });
+    throw new HttpError(409, "This project is already rendering.");
   if (queue.length >= 20)
-    return res
-      .status(429)
-      .json({ error: "The render queue is full. Please try again shortly." });
-  const audio = ownedUpload(p.audioId, req.user.id, "narration");
+    throw new HttpError(
+      429,
+      "The render queue is full. Please try again shortly.",
+    );
+  const audio = ownedUpload(p.audioId, uid, "narration");
   const cost = p.file ? 4 : quote(p.script, audio?.duration).credits;
-  if (req.user.credits < cost)
-    return res
-      .status(402)
-      .json({ error: "Not enough local credits for this render." });
+  if (user.credits < cost)
+    throw new HttpError(
+      402,
+      "Not enough credits for this render. Choose a plan to add credits.",
+    );
   transaction(() => {
     credit(
-      req.user.id,
+      uid,
       p.id,
       p.file ? "Updated video export" : "Video generation",
       -cost,
@@ -426,28 +482,31 @@ app.post("/api/projects/:id/render", auth, (req, res) => {
       stage: "Waiting in the render queue",
     });
   });
-  queue.push({ id: p.id, uid: req.user.id });
-  res.status(202).json(p);
+  queue.push({ id: p.id, uid });
   void drain();
-});
-app.post("/api/projects/:id/cancel", auth, (req, res) => {
-  const p = find(req.params.id, req.user.id);
-  if (!p) return res.status(404).json({ error: "Project not found." });
+  return p;
+}
+app.post(
+  "/api/projects/:id/render",
+  auth,
+  emailService.requireVerified,
+  (req, res) => res.status(202).json(enqueueRender(req.user.id, req.params.id)),
+);
+function cancelProject(uid, id) {
+  const p = find(id, uid);
+  if (!p) throw new HttpError(404, "Project not found.");
   if (!["queued", "running"].includes(p.status))
-    return res.status(409).json({ error: "This job is no longer running." });
+    throw new HttpError(409, "This job is no longer running.");
   active.get(p.id)?.abort();
-  const value = transaction(() => {
+  return transaction(() => {
     if (p.reserved)
-      credit(
-        req.user.id,
-        p.id,
-        "Generation cancelled — credits returned",
-        p.reserved,
-      );
+      credit(uid, p.id, "Generation cancelled — credits returned", p.reserved);
     return save({ ...p, status: "cancelled", reserved: 0, stage: "Cancelled" });
   });
-  res.json(value);
-});
+}
+app.post("/api/projects/:id/cancel", auth, (req, res) =>
+  res.json(cancelProject(req.user.id, req.params.id)),
+);
 app.get("/api/projects/:id/:asset", auth, (req, res, next) => {
   if (!["video", "poster", "download", "manifest"].includes(req.params.asset))
     return next();
@@ -543,44 +602,7 @@ app.post("/api/scripts", auth, async (req, res) => {
     .slice(0, 300);
   if (topic.length < 3)
     return res.status(400).json({ error: "Tell us what your video is about." });
-  let content,
-    source = "starter";
-  if (process.env.OPENROUTER_API_KEY) {
-    const response = await fetch(
-      "https://openrouter.ai/api/v1/chat/completions",
-      {
-        method: "POST",
-        signal: AbortSignal.timeout(60000),
-        headers: {
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: process.env.OPENROUTER_MODEL || "openai/gpt-4o-mini",
-          max_tokens: 1200,
-          messages: [
-            {
-              role: "system",
-              content:
-                "Write an accurate, engaging 150-250 word YouTube narration script. Plain text only, no headings or stage directions. Do not invent facts, sources, or statistics.",
-            },
-            { role: "user", content: topic },
-          ],
-        }),
-      },
-    );
-    const result = await response.json();
-    if (!response.ok || !result.choices?.[0]?.message?.content)
-      return res
-        .status(502)
-        .json({
-          error:
-            "The script provider could not complete this request. Try again.",
-        });
-    content = result.choices[0].message.content.slice(0, 8000);
-    source = "ai";
-  } else
-    content = `What makes ${topic} worth exploring? Sometimes, the most interesting stories begin with a simple question.\n\nIn this video, we are taking a closer look at ${topic}. Start with what you already know, then look for the detail you might have missed. A new perspective can turn an ordinary subject into a remarkable story.\n\nConsider the people, places, and ideas connected to this topic. What changed over time? What surprised you? Add one verified example here to make the story your own.\n\nThe next time you think about ${topic}, take a moment to look a little closer. There is always more to discover. If this sparked your curiosity, save this video and join us for the next story.`;
+  const { content, source } = await generateNarration(topic);
   const row = {
     id: randomUUID(),
     title: topic,
@@ -647,6 +669,27 @@ app.patch("/api/me", auth, (req, res) => {
   db.prepare("UPDATE users SET name=? WHERE id=?").run(name, req.user.id);
   res.json({ user: publicUser(userById(req.user.id)) });
 });
+installSeries({
+  app,
+  db,
+  auth,
+  requireVerified: emailService.requireVerified,
+  transaction,
+  createProject,
+  enqueueRender,
+  find,
+  youtube: youtubeService,
+});
+installMCP({
+  app,
+  auth,
+  db,
+  find,
+  createProject,
+  enqueueRender,
+  cancelProject,
+});
+installReadiness({ app, auth });
 app.use("/api", (_req, res) =>
   res.status(404).json({ error: "API route not found." }),
 );
@@ -659,15 +702,16 @@ app.get("/{*path}", (_req, res) =>
         .send("Run npm run build, or use the Vite development server."),
 );
 app.use((err, _req, res, _next) => {
-  console.error(err.message);
-  res
-    .status(err instanceof multer.MulterError ? 400 : 400)
-    .json({
-      error:
-        err.code === "LIMIT_FILE_SIZE"
-          ? "File too large. The limit is 100 MB."
+  if (!err.status && err.name !== "SyntaxError")
+    console.error("Request failed:", err.name);
+  res.status(err.status || 400).json({
+    error:
+      err.code === "LIMIT_FILE_SIZE"
+        ? "File too large. The limit is 100 MB."
+        : err.type === "entity.parse.failed"
+          ? "The request body is not valid JSON."
           : err.message || "Something went wrong.",
-    });
+  });
 });
 // Recover reservations atomically after a process restart.
 for (const row of db.prepare("SELECT data FROM projects").all()) {

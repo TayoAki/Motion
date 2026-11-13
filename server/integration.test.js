@@ -278,7 +278,74 @@ test(
       (await req("/projects", "GET", null, null, key.key)).status,
       200,
     );
+    const rpc = (method, params = {}, bearer = key.key) =>
+      req(
+        "/mcp",
+        "POST",
+        { jsonrpc: "2.0", id: 1, method, params },
+        null,
+        bearer,
+      );
+    assert.equal(
+      (await rpc("initialize", { protocolVersion: "2025-06-18" })).body.result
+        .protocolVersion,
+      "2025-06-18",
+    );
+    assert.ok(
+      (await rpc("tools/list")).body.result.tools.some(
+        (t) => t.name === "project_render",
+      ),
+    );
+    assert.equal(
+      (await rpc("tools/call", { name: "project_get", arguments: { id } })).body
+        .result.isError,
+      undefined,
+    );
+    assert.equal(
+      JSON.parse(
+        (await rpc("tools/call", { name: "project_export", arguments: { id } }))
+          .body.result.content[0].text,
+      ).requiresAuthorization,
+      true,
+    );
+    const mcpDraft = JSON.parse(
+      (
+        await rpc("tools/call", {
+          name: "project_create",
+          arguments: {
+            title: "Agent draft",
+            script: "A story made through the authenticated agent API.",
+          },
+        })
+      ).body.result.content[0].text,
+    );
+    assert.equal(
+      (await req(`/projects/${mcpDraft.id}`, "GET", null, outsider.cookie))
+        .status,
+      404,
+    );
+    await req(`/projects/${mcpDraft.id}`, "DELETE", null, cookie);
+    assert.equal((await rpc("unknown-method")).body.error.code, -32601);
+    assert.equal(
+      (
+        await rpc("tools/call", {
+          name: "project_get",
+          arguments: { id: "missing" },
+        })
+      ).body.result.isError,
+      true,
+    );
+    assert.equal(
+      (
+        await rpc("tools/call", {
+          name: "project_create",
+          arguments: { script: "bad", userId: outsider.body.user.id },
+        })
+      ).body.error.code,
+      -32602,
+    );
     await req(`/keys/${key.id}`, "DELETE", null, cookie);
+    assert.equal((await rpc("tools/list")).status, 401);
     assert.equal(
       (await req("/projects", "GET", null, null, key.key)).status,
       401,
