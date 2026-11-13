@@ -527,6 +527,7 @@ export function PublishStudio({ user, projects, requireUser, notify }) {
     [title, setTitle] = useState(""),
     [description, setDescription] = useState(""),
     [privacy, setPrivacy] = useState("private"),
+    [retryTimes, setRetryTimes] = useState({}),
     [publishAt, setPublishAt] = useState(""),
     [kids, setKids] = useState(false),
     [synthetic, setSynthetic] = useState(false),
@@ -585,8 +586,8 @@ export function PublishStudio({ user, projects, requireUser, notify }) {
         <span className="eyebrow">CREATE. CONNECT. PUBLISH.</span>
         <h1>Your channel, in a rhythm</h1>
         <p>
-          Upload a finished export now or choose a time for YouTube to publish
-          it.
+          Connect through Outstand, then publish a finished export now or
+          schedule its delivery to YouTube.
         </p>
       </div>
       {(error || notice.get("error")) && (
@@ -605,8 +606,8 @@ export function PublishStudio({ user, projects, requireUser, notify }) {
           <h2>{data?.channel?.title || "Connect your YouTube channel"}</h2>
           <p>
             {data?.channel
-              ? "Your access tokens are encrypted on the server. Disconnecting leaves existing YouTube videos and schedules in place."
-              : "Grant access through Google. Your password is never shared with this app."}
+              ? "Outstand manages your Google connection and delivery. Cancel pending publications before disconnecting. Published videos remain on YouTube."
+              : "Connect with Outstand's managed YouTube integration. No separate Google Cloud app is required."}
           </p>
         </div>
         {!user ? (
@@ -620,19 +621,27 @@ export function PublishStudio({ user, projects, requireUser, notify }) {
             onClick={() =>
               data?.channel
                 ? window.confirm(
-                    "Disconnect YouTube? Existing videos and schedules will remain on YouTube.",
+                    "Remove this channel connection from Outstand? Published YouTube videos will remain. You will need to authorize again to reconnect.",
                   ) && act("/connection", undefined, "DELETE")
                 : act("/connect", {})
             }
           >
-            {data?.channel ? "Disconnect channel" : "Connect with Google"}
+            {data?.channel ? "Disconnect channel" : "Connect via Outstand"}
           </button>
         )}
         {user && !data?.configured && (
           <div className="info-note">
-            Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and
-            TOKEN_ENCRYPTION_KEY. Add this exact OAuth callback in Google Cloud:{" "}
-            <code>{data?.callbackURL || "Loading…"}</code>
+            Set OUTSTAND_API_KEY on the server using an active Outstand
+            subscription. Your key needs account connection/read/disconnect,
+            media upload, and post create/read/update/publish/delete
+            permissions.{" "}
+            <a
+              href="https://www.outstand.so/docs/getting-started"
+              target="_blank"
+              rel="noreferrer"
+            >
+              Outstand setup guide
+            </a>
           </div>
         )}
       </section>
@@ -693,7 +702,6 @@ export function PublishStudio({ user, projects, requireUser, notify }) {
                   <select
                     value={privacy}
                     onChange={(e) => setPrivacy(e.target.value)}
-                    disabled={!!publishAt}
                   >
                     <option value="private">Private</option>
                     <option value="unlisted">Unlisted</option>
@@ -710,9 +718,10 @@ export function PublishStudio({ user, projects, requireUser, notify }) {
                 </label>
               </div>
               <p className="footnote">
-                Scheduled videos stay private until YouTube publishes them.
-                Choose at least ten minutes from now. Unverified Google API
-                projects may be restricted to private uploads.
+                Outstand begins delivery at the selected time and preserves the
+                visibility chosen above. Choose between ten minutes and 30 days
+                from now. Publication is confirmed only after Outstand reports
+                YouTube success.
               </p>
               <label className="integration-check">
                 <input
@@ -737,8 +746,9 @@ export function PublishStudio({ user, projects, requireUser, notify }) {
                   checked={confirmed}
                   onChange={(e) => setConfirmed(e.target.checked)}
                 />
-                I own the rights to this video and confirm these publishing
-                choices.
+                I own the rights and authorize uploading this export to Outstand
+                and publishing with these choices. Outstand uses a public media
+                URL and retains uploaded files for up to 60 days.
               </label>
               <button className="button primary" disabled={busy || !confirmed}>
                 {busy
@@ -770,13 +780,29 @@ export function PublishStudio({ user, projects, requireUser, notify }) {
                   <div>
                     <strong>{p.title}</strong>
                     <span>
-                      {p.status} · {p.privacy}
+                      {p.status} · {p.privacy} ·{" "}
+                      {p.provider === "outstand" ? "Outstand" : "Legacy Google"}
                       {p.publishAt ? ` · ${date(p.publishAt)}` : ""}
                     </span>
                     {["queued", "uploading", "finishing"].includes(
                       p.status,
                     ) && <progress value={p.progress} max={100} />}{" "}
                     {p.error && <p className="error-message">{p.error}</p>}
+                    {p.retryable && p.postId && p.publishAt && (
+                      <label>
+                        New publishing time (optional)
+                        <input
+                          type="datetime-local"
+                          value={retryTimes[p.id] || ""}
+                          onChange={(e) =>
+                            setRetryTimes({
+                              ...retryTimes,
+                              [p.id]: e.target.value,
+                            })
+                          }
+                        />
+                      </label>
+                    )}
                   </div>
                   <div className="integration-toolbar">
                     {p.url && (
@@ -785,22 +811,33 @@ export function PublishStudio({ user, projects, requireUser, notify }) {
                         <ExternalLink size={14} />
                       </a>
                     )}
-                    {p.status === "failed" && (
+                    {p.retryable && (
                       <button
                         className="button secondary small"
                         disabled={busy}
-                        onClick={() => act(`/publications/${p.id}/retry`, {})}
+                        onClick={() =>
+                          act(
+                            `/publications/${p.id}/retry`,
+                            retryTimes[p.id]
+                              ? {
+                                  publishAt: new Date(
+                                    retryTimes[p.id],
+                                  ).toISOString(),
+                                }
+                              : {},
+                          )
+                        }
                       >
                         Resume upload
                       </button>
                     )}
-                    {p.status === "scheduled" && (
+                    {p.provider === "outstand" && p.status === "scheduled" && (
                       <button
                         className="button secondary small"
                         disabled={busy}
                         onClick={() =>
                           window.confirm(
-                            "Remove this scheduled time and keep the video private?",
+                            "Cancel delivery and remove this scheduled post from Outstand?",
                           ) && act(`/publications/${p.id}/cancel-schedule`, {})
                         }
                       >

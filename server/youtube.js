@@ -1,16 +1,10 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { copyFile, mkdir, open, stat, unlink } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { copyFile, mkdir, stat, unlink } from "node:fs/promises";
 import path from "node:path";
-import {
-  appURL,
-  encryptionReady,
-  seal,
-  unseal,
-  providerFetch,
-  providerJSON,
-  HttpError,
-} from "./providers.js";
+import { appURL, providerFetch, HttpError } from "./providers.js";
 
+// Preserve the studio's YouTube API while delegating connection and delivery to Outstand.
 export function installYouTube({
   app,
   db,
@@ -20,118 +14,183 @@ export function installYouTube({
   find,
   requireVerified,
 }) {
-  db.exec(`CREATE TABLE IF NOT EXISTS youtube_connections(user_id TEXT PRIMARY KEY REFERENCES users(id),channel_id TEXT,title TEXT,access_token TEXT,refresh_token TEXT,expires INTEGER);
-    CREATE TABLE IF NOT EXISTS youtube_states(hash TEXT PRIMARY KEY,user_id TEXT REFERENCES users(id),expires INTEGER);
-    CREATE TABLE IF NOT EXISTS publications(id TEXT PRIMARY KEY,user_id TEXT REFERENCES users(id),project_id TEXT,version INTEGER,title TEXT,description TEXT,privacy TEXT,publish_at TEXT,made_for_kids INTEGER,synthetic INTEGER,status TEXT,progress INTEGER,file TEXT,size INTEGER,upload_url TEXT,video_id TEXT,error TEXT,created TEXT,updated TEXT,UNIQUE(user_id,project_id,version));`);
-  if (
-    !db
+  db.exec(`CREATE TABLE IF NOT EXISTS publications(id TEXT PRIMARY KEY,user_id TEXT REFERENCES users(id),project_id TEXT,version INTEGER,title TEXT,description TEXT,privacy TEXT,publish_at TEXT,made_for_kids INTEGER,synthetic INTEGER,status TEXT,progress INTEGER,file TEXT,size INTEGER,upload_url TEXT,video_id TEXT,error TEXT,created TEXT,updated TEXT,UNIQUE(user_id,project_id,version));
+    CREATE TABLE IF NOT EXISTS outstand_connections(user_id TEXT PRIMARY KEY REFERENCES users(id),account_id TEXT UNIQUE,channel_id TEXT,title TEXT,created TEXT);
+    CREATE TABLE IF NOT EXISTS outstand_states(hash TEXT PRIMARY KEY,user_id TEXT REFERENCES users(id),expires INTEGER);`);
+  const columns = new Set(
+    db
       .prepare("PRAGMA table_info(publications)")
       .all()
-      .some((c) => c.name === "channel_id")
-  )
-    db.exec("ALTER TABLE publications ADD COLUMN channel_id TEXT");
-  const configured = !!(
-    process.env.GOOGLE_CLIENT_ID &&
-    process.env.GOOGLE_CLIENT_SECRET &&
-    encryptionReady()
+      .map((c) => c.name),
   );
-  const callbackURL = () => `${appURL()}/api/youtube/callback`;
+  const additions = {
+    channel_id: "TEXT",
+    provider: "TEXT DEFAULT 'google'",
+    outstand_post_id: "TEXT",
+    outstand_media_id: "TEXT",
+    outstand_media_url: "TEXT",
+    outstand_upload_done: "INTEGER DEFAULT 0",
+    outstand_request: "TEXT",
+    outstand_create_at: "INTEGER",
+    outstand_activated: "INTEGER DEFAULT 0",
+    outstand_last_poll: "INTEGER DEFAULT 0",
+    outstand_attempt: "INTEGER DEFAULT 0",
+    outstand_retry: "INTEGER DEFAULT 0",
+    outstand_recreate: "TEXT",
+    outstand_history: "TEXT DEFAULT '[]'",
+  };
+  for (const [name, type] of Object.entries(additions))
+    if (!columns.has(name))
+      db.exec(`ALTER TABLE publications ADD COLUMN ${name} ${type}`);
+  db.prepare(
+    "UPDATE publications SET status='blocked',error='Legacy Google job retained. Check YouTube Studio before creating another export.' WHERE provider='google' AND status IN ('queued','uploading','finishing')",
+  ).run();
+  const configured = !!process.env.OUTSTAND_API_KEY;
   const connection = (uid) =>
-    db.prepare("SELECT * FROM youtube_connections WHERE user_id=?").get(uid);
+    db.prepare("SELECT * FROM outstand_connections WHERE user_id=?").get(uid);
   const get = (id, uid) =>
     db
       .prepare("SELECT * FROM publications WHERE id=? AND user_id=?")
       .get(id, uid);
+  const callbackURL = () => `${appURL()}/api/youtube/callback`;
+  function ready() {
+    if (!configured)
+      throw new HttpError(
+        503,
+        "Configure OUTSTAND_API_KEY on the server to connect and publish to YouTube.",
+      );
+  }
+  function update(id, values) {
+    const fields = { ...values, updated: new Date().toISOString() };
+    db.prepare(
+      `UPDATE publications SET ${Object.keys(fields)
+        .map((k) => `${k}=?`)
+        .join(",")} WHERE id=?`,
+    ).run(...Object.values(fields), id);
+  }
+  async function cleanupCompleted() {
+    const completed = db
+      .prepare(
+        "SELECT id,file FROM publications WHERE provider='outstand' AND status IN ('published','cancelled') AND file IS NOT NULL LIMIT 100",
+      )
+      .all();
+    for (const job of completed) {
+      // Delete only the private publication copy, never a project's original export.
+      if (
+        path.resolve(job.file) !==
+        path.resolve(root, "publishing", `${job.id}.mp4`)
+      )
+        continue;
+      try {
+        await unlink(job.file);
+      } catch (error) {
+        if (error.code !== "ENOENT") continue;
+      }
+      db.prepare(
+        "UPDATE publications SET file=NULL WHERE id=? AND file=? AND provider='outstand' AND status IN ('published','cancelled')",
+      ).run(job.id, job.file);
+    }
+  }
   const safeJob = (j) => ({
     id: j.id,
     projectId: j.project_id,
     title: j.title,
+    provider: j.provider,
     privacy: j.privacy,
     publishAt: j.publish_at,
     status: j.status,
     progress: j.progress,
     videoId: j.video_id,
-    url: j.video_id
-      ? `https://www.youtube.com/watch?v=${encodeURIComponent(j.video_id)}`
-      : null,
+    postId: j.outstand_post_id,
+    url:
+      j.video_id && /^[\w-]{6,64}$/.test(j.video_id)
+        ? `https://www.youtube.com/watch?v=${encodeURIComponent(j.video_id)}`
+        : null,
     error: j.error,
     created: j.created,
     updated: j.updated,
+    retryable: j.provider === "outstand" && j.status === "failed",
   });
-  function ready() {
-    if (!configured)
-      throw new HttpError(
-        503,
-        "Configure GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and a 32-byte TOKEN_ENCRYPTION_KEY to connect YouTube.",
-      );
-  }
-  const refreshes = new Map();
-  async function access(uid, force = false) {
+  async function api(route, options = {}, acceptCreatedPost = false) {
     ready();
-    const c = connection(uid);
-    if (!c) throw new HttpError(400, "Connect a YouTube channel first.");
-    if (!force && c.expires > Date.now() + 60000) return unseal(c.access_token);
-    if (!refreshes.has(uid))
-      refreshes.set(
-        uid,
-        (async () => {
-          const token = await providerJSON(
-            "https://oauth2.googleapis.com/token",
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/x-www-form-urlencoded" },
-              body: new URLSearchParams({
-                client_id: process.env.GOOGLE_CLIENT_ID,
-                client_secret: process.env.GOOGLE_CLIENT_SECRET,
-                refresh_token: unseal(c.refresh_token),
-                grant_type: "refresh_token",
-              }),
-            },
-            "Google token refresh",
-          );
-          if (!token.access_token)
-            throw new HttpError(
-              502,
-              "Google did not return an access token. Reconnect your channel.",
-            );
-          db.prepare(
-            "UPDATE youtube_connections SET access_token=?,refresh_token=?,expires=? WHERE user_id=?",
-          ).run(
-            seal(token.access_token),
-            token.refresh_token ? seal(token.refresh_token) : c.refresh_token,
-            Date.now() + Number(token.expires_in || 3600) * 1000,
-            uid,
-          );
-          return token.access_token;
-        })().finally(() => refreshes.delete(uid)),
-      );
-    return refreshes.get(uid);
-  }
-  async function youtube(uid, route, body, method = body ? "PUT" : "GET") {
-    const call = async (force) =>
-      providerFetch(`https://www.googleapis.com/youtube/v3${route}`, {
-        method,
+    let response;
+    try {
+      response = await providerFetch(`https://api.outstand.so/v1${route}`, {
+        ...options,
         headers: {
-          Authorization: `Bearer ${await access(uid, force)}`,
-          ...(body ? { "Content-Type": "application/json" } : {}),
+          Authorization: `Bearer ${process.env.OUTSTAND_API_KEY}`,
+          "Content-Type": "application/json",
+          ...options.headers,
         },
-        ...(body ? { body: JSON.stringify(body) } : {}),
       });
-    let response = await call(false);
-    if (response.status === 401) response = await call(true);
-    if (!response.ok)
+    } catch {
       throw new HttpError(
         502,
-        "YouTube rejected this request. Check the channel's permissions, quota, and Google app verification.",
+        "Outstand could not be reached. Retry the existing job to recover its state.",
       );
-    return response.status === 204 ? {} : response.json();
+    }
+    const result = await response.json().catch(() => ({}));
+    if (acceptCreatedPost && typeof result.post?.id === "string") return result;
+    if (!response.ok || result.success === false) {
+      const error = new HttpError(
+        502,
+        response.status === 402
+          ? "Outstand requires an active subscription before API publishing is available."
+          : response.status === 403
+            ? "The Outstand API key lacks permission for this operation."
+            : "Outstand rejected the request. Check its dashboard, account connection, and API key permissions.",
+      );
+      error.providerStatus = response.status;
+      throw error;
+    }
+    return result;
+  }
+  async function ownedAccount(uid, id) {
+    const query = new URLSearchParams({
+      id,
+      tenantId: uid,
+      network: "youtube",
+      includeTokens: "false",
+      limit: "100",
+    });
+    const result = await api(`/social-accounts?${query}`);
+    const account = result.data?.find(
+      (a) =>
+        a.id === id &&
+        a.network === "youtube" &&
+        a.tenant_id === uid &&
+        (a.isActive === true || a.isActive === 1),
+    );
+    if (!account)
+      throw new HttpError(
+        403,
+        "Outstand did not confirm an active YouTube account belonging to this workspace. Reconnect it from Motion.",
+      );
+    return account;
+  }
+  function active(uid) {
+    return db
+      .prepare(
+        "SELECT id FROM publications WHERE user_id=? AND provider='outstand' AND status IN ('queued','uploading','finishing','waiting','scheduled')",
+      )
+      .get(uid);
+  }
+  function assertChannel(job) {
+    if (connection(job.user_id)?.account_id !== job.channel_id)
+      throw new HttpError(
+        409,
+        "Reconnect the original Outstand channel before managing this publication.",
+      );
   }
   app.get("/api/youtube", auth, (req, res) => {
     const c = connection(req.user.id);
     res.json({
       configured,
+      provider: "outstand",
       callbackURL: callbackURL(),
-      channel: c ? { id: c.channel_id, title: c.title } : null,
+      channel: c
+        ? { id: c.channel_id, title: c.title, accountId: c.account_id }
+        : null,
       publications: db
         .prepare(
           "SELECT * FROM publications WHERE user_id=? ORDER BY created DESC LIMIT 100",
@@ -140,357 +199,440 @@ export function installYouTube({
         .map(safeJob),
     });
   });
-  app.post("/api/youtube/connect", auth, requireVerified, (req, res) => {
+  app.post("/api/youtube/connect", auth, requireVerified, async (req, res) => {
     ready();
-    if (
-      db
-        .prepare(
-          "SELECT id FROM publications WHERE user_id=? AND status IN ('queued','uploading','finishing')",
-        )
-        .get(req.user.id)
-    )
+    if (active(req.user.id))
       throw new HttpError(
         409,
-        "Wait for active uploads before changing channels.",
+        "Finish or cancel pending Outstand publications before changing channels.",
       );
-    db.prepare("DELETE FROM youtube_states WHERE expires<? OR user_id=?").run(
+    const state = randomBytes(32).toString("hex"),
+      redirect = new URL(callbackURL());
+    redirect.searchParams.set("state", state);
+    db.prepare("DELETE FROM outstand_states WHERE expires<? OR user_id=?").run(
       Date.now(),
       req.user.id,
     );
-    const state = randomBytes(32).toString("hex");
-    db.prepare("INSERT INTO youtube_states VALUES(?,?,?)").run(
+    db.prepare("INSERT INTO outstand_states VALUES(?,?,?)").run(
       digest(state),
       req.user.id,
       Date.now() + 600000,
     );
-    const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
-    url.search = new URLSearchParams({
-      client_id: process.env.GOOGLE_CLIENT_ID,
-      redirect_uri: callbackURL(),
-      response_type: "code",
-      scope:
-        "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly",
-      access_type: "offline",
-      prompt: "consent",
-      state,
-    }).toString();
+    const result = await api("/social-networks/youtube/auth-url", {
+      method: "POST",
+      body: JSON.stringify({
+        redirect_uri: redirect.toString(),
+        tenant_id: req.user.id,
+        force_account_selection: true,
+      }),
+    });
+    const url = new URL(result.data?.auth_url || "invalid:");
+    if (
+      url.protocol !== "https:" ||
+      !["www.outstand.so", "outstand.so"].includes(url.hostname) ||
+      !url.pathname.startsWith("/app/api/socials/youtube/") ||
+      url.username ||
+      url.password ||
+      url.port
+    )
+      throw new HttpError(
+        502,
+        "Outstand returned an invalid connection address.",
+      );
     res.json({ url: url.toString() });
   });
   app.get("/api/youtube/callback", async (req, res) => {
     try {
       ready();
       const state = typeof req.query.state === "string" ? req.query.state : "";
-      const row = /^[0-9a-f]{64}$/.test(state)
+      const record = /^[a-f0-9]{64}$/.test(state)
         ? db
-            .prepare("SELECT * FROM youtube_states WHERE hash=? AND expires>?")
+            .prepare("SELECT * FROM outstand_states WHERE hash=? AND expires>?")
             .get(digest(state), Date.now())
         : null;
-      if (!req.user || !row || row.user_id !== req.user.id)
-        throw new Error(
-          "The connection request expired. Sign in and reconnect.",
+      if (!req.user || !record || record.user_id !== req.user.id)
+        throw new HttpError(
+          400,
+          "The connection request expired. Sign in and reconnect through Outstand.",
         );
-      db.prepare("DELETE FROM youtube_states WHERE hash=?").run(digest(state));
-      if (req.query.error)
-        throw new Error(
-          "Google authorization was cancelled. Your channel was not changed.",
+      db.prepare("DELETE FROM outstand_states WHERE hash=?").run(digest(state));
+      if (req.query.error || req.query.success !== "true")
+        throw new HttpError(
+          400,
+          "Outstand authorization was cancelled or did not succeed.",
         );
-      if (typeof req.query.code !== "string" || req.query.code.length > 2048)
-        throw new Error("Google did not return an authorization code.");
-      const token = await providerJSON(
-        "https://oauth2.googleapis.com/token",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            client_id: process.env.GOOGLE_CLIENT_ID,
-            client_secret: process.env.GOOGLE_CLIENT_SECRET,
-            code: req.query.code,
-            redirect_uri: callbackURL(),
-            grant_type: "authorization_code",
-          }),
-        },
-        "Google authorization",
-      );
-      if (!token.access_token || !token.refresh_token)
-        throw new Error(
-          "Google did not grant offline access. Reconnect and grant the requested permissions.",
+      const id = req.query.account_id;
+      if (typeof id !== "string" || !id || id.length > 255)
+        throw new HttpError(
+          400,
+          "Outstand did not return an account identifier.",
         );
-      const channels = await providerJSON(
-        "https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true",
-        { headers: { Authorization: `Bearer ${token.access_token}` } },
-        "YouTube channel lookup",
-      );
-      const channel = channels.items?.[0];
-      if (!channel?.id)
-        throw new Error("This Google account has no YouTube channel.");
-      // Keep existing credentials until both authorization and channel discovery succeed.
+      const account = await ownedAccount(req.user.id, id);
+      if (active(req.user.id))
+        throw new HttpError(
+          409,
+          "A publication started while connecting. Finish it before changing channels.",
+        );
+      if (
+        db
+          .prepare(
+            "SELECT user_id FROM outstand_connections WHERE account_id=? AND user_id<>?",
+          )
+          .get(id, req.user.id)
+      )
+        throw new HttpError(
+          409,
+          "This Outstand account is already connected to another workspace.",
+        );
       db.prepare(
-        "INSERT INTO youtube_connections VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET channel_id=excluded.channel_id,title=excluded.title,access_token=excluded.access_token,refresh_token=excluded.refresh_token,expires=excluded.expires",
+        "INSERT INTO outstand_connections VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET account_id=excluded.account_id,channel_id=excluded.channel_id,title=excluded.title,created=excluded.created",
       ).run(
         req.user.id,
-        channel.id,
-        String(channel.snippet?.title || "YouTube channel").slice(0, 200),
-        seal(token.access_token),
-        seal(token.refresh_token),
-        Date.now() + Number(token.expires_in || 3600) * 1000,
+        id,
+        account.network_unique_id || id,
+        String(account.nickname || account.username || "YouTube channel").slice(
+          0,
+          200,
+        ),
+        new Date().toISOString(),
       );
       res.redirect(`${appURL()}/#autopilot?connected=1`);
-    } catch (e) {
-      const message = e.status
-        ? "Google could not complete the connection. Check the OAuth configuration and try again."
-        : e.message;
+    } catch (error) {
       res.redirect(
-        `${appURL()}/#autopilot?error=${encodeURIComponent(message)}`,
+        `${appURL()}/#autopilot?error=${encodeURIComponent(error instanceof HttpError ? error.message : "Outstand could not complete the connection. Check its configuration and try again.")}`,
       );
     }
   });
   app.delete("/api/youtube/connection", auth, async (req, res) => {
-    if (
-      db
-        .prepare(
-          "SELECT id FROM publications WHERE user_id=? AND status IN ('queued','uploading','finishing')",
-        )
-        .get(req.user.id)
-    )
+    if (active(req.user.id))
       throw new HttpError(
         409,
-        "Wait for active uploads to finish before disconnecting.",
+        "Finish or cancel pending Outstand publications before disconnecting.",
       );
     const c = connection(req.user.id);
     if (c) {
-      const response = await providerFetch(
-        "https://oauth2.googleapis.com/revoke",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({ token: unseal(c.refresh_token) }),
-        },
-      );
-      if (!response.ok && response.status !== 400)
-        throw new HttpError(
-          502,
-          "Google could not revoke access. Retry disconnecting.",
-        );
+      await ownedAccount(req.user.id, c.account_id);
+      await api(`/social-accounts/${encodeURIComponent(c.account_id)}`, {
+        method: "DELETE",
+      });
     }
-    db.prepare("DELETE FROM youtube_connections WHERE user_id=?").run(
+    db.prepare("DELETE FROM outstand_connections WHERE user_id=?").run(
       req.user.id,
     );
-    db.prepare("DELETE FROM youtube_states WHERE user_id=?").run(req.user.id);
+    db.prepare("DELETE FROM outstand_states WHERE user_id=?").run(req.user.id);
+    db.prepare(
+      "UPDATE series SET active=0,error='YouTube channel disconnected. Reconnect before resuming.' WHERE user_id=?",
+    ).run(req.user.id);
     res.json({
       message:
-        "Channel disconnected. Existing videos and YouTube schedules remain on YouTube.",
+        "Channel disconnected from Outstand. Published videos remain on YouTube.",
     });
   });
-  function uploadURL(value) {
+  function schedule(value) {
+    if (!value) return null;
+    const time = Date.parse(value);
+    if (
+      !Number.isFinite(time) ||
+      time < Date.now() + 600000 ||
+      time > Date.now() + 30 * 86400000
+    )
+      throw new HttpError(
+        400,
+        "Choose a publishing time at least ten minutes and no more than 30 days from now.",
+      );
+    return new Date(time).toISOString();
+  }
+  function mediaURL(value, upload = false) {
     const url = new URL(value);
     if (
       url.protocol !== "https:" ||
-      ![
-        "www.googleapis.com",
-        "youtube.googleapis.com",
-        "upload.youtube.com",
-      ].includes(url.hostname)
+      !(upload
+        ? url.hostname.endsWith(".r2.cloudflarestorage.com")
+        : url.hostname === "media.outstand.so") ||
+      url.username ||
+      url.password ||
+      url.port
     )
-      throw new Error("YouTube returned an invalid upload session.");
+      throw new HttpError(502, "Outstand returned an invalid media address.");
     return url.toString();
   }
-  function offset(response, size) {
-    const range = response.headers.get("range");
-    const value = range ? Number(/^bytes=0-(\d+)$/.exec(range)?.[1]) + 1 : 0;
-    if (!Number.isSafeInteger(value) || value < 0 || value > size)
-      throw new Error("YouTube returned an invalid upload offset.");
-    return value;
-  }
-  async function setVideo(job, videoId) {
-    if (!/^[\w-]{6,64}$/.test(videoId || ""))
-      throw new Error("YouTube did not return a video ID.");
-    db.prepare(
-      "UPDATE publications SET video_id=?,status='finishing',progress=95,updated=? WHERE id=?",
-    ).run(videoId, new Date().toISOString(), job.id);
-    const status = {
-      privacyStatus: job.publish_at ? "private" : job.privacy,
-      selfDeclaredMadeForKids: !!job.made_for_kids,
-      containsSyntheticMedia: !!job.synthetic,
-      ...(job.publish_at ? { publishAt: job.publish_at } : {}),
-    };
-    if (job.publish_at && Date.parse(job.publish_at) < Date.now() + 60000)
-      throw new Error(
-        "The scheduled time passed during upload. The video is private; choose a new time in YouTube Studio.",
-      );
-    const result = await youtube(job.user_id, "/videos?part=status", {
-      id: videoId,
-      status,
-    });
-    const actual = result.status || status;
-    const warning =
-      !job.publish_at && job.privacy !== actual.privacyStatus
-        ? "Google kept this video private. Unverified YouTube API projects may only upload private videos."
-        : null;
-    db.prepare(
-      "UPDATE publications SET status=?,privacy=?,publish_at=?,error=?,progress=100,updated=? WHERE id=?",
-    ).run(
-      actual.publishAt ? "scheduled" : "published",
-      actual.privacyStatus || "private",
-      actual.publishAt || null,
-      warning,
-      new Date().toISOString(),
-      job.id,
-    );
-    await unlink(job.file).catch(() => {});
-  }
-  async function upload(job) {
-    if (
-      !connection(job.user_id) ||
-      connection(job.user_id).channel_id !== job.channel_id
-    )
-      throw new Error(
-        "The connected channel changed. Reconnect the original channel to resume this publication.",
-      );
-    if (job.video_id) return setVideo(job, job.video_id);
-    let url = job.upload_url ? unseal(job.upload_url) : null;
-    if (!url) {
-      const response = await providerFetch(
-        "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${await access(job.user_id)}`,
-            "Content-Type": "application/json",
-            "X-Upload-Content-Length": String(job.size),
-            "X-Upload-Content-Type": "video/mp4",
-          },
-          body: JSON.stringify({
-            snippet: {
-              title: job.title,
-              description: job.description,
-              categoryId: "22",
-            },
-            status: {
-              privacyStatus: "private",
-              selfDeclaredMadeForKids: !!job.made_for_kids,
-              containsSyntheticMedia: !!job.synthetic,
-            },
-          }),
-        },
-      );
-      if (!response.ok || !response.headers.get("location"))
-        throw new Error(
-          "YouTube could not start the upload. Check API quota and channel permissions.",
-        );
-      url = uploadURL(response.headers.get("location"));
-      db.prepare("UPDATE publications SET upload_url=? WHERE id=?").run(
-        seal(url),
-        job.id,
-      );
-    }
-    uploadURL(url);
-    const send = async (headers, body) => {
-      const call = async (force) =>
-        providerFetch(url, {
+  async function prepareMedia(job) {
+    if (job.outstand_media_url) return job.outstand_media_url;
+    let mediaId = job.outstand_media_id;
+    if (!mediaId || !job.outstand_upload_done) {
+      const result = await api("/media/upload", {
+        method: "POST",
+        body: JSON.stringify({
+          filename: `${job.id}.mp4`,
+          content_type: "video/mp4",
+        }),
+      });
+      if (typeof result.data?.id !== "string")
+        throw new HttpError(502, "Outstand did not return a media identifier.");
+      const url = mediaURL(result.data.upload_url, true);
+      mediaId = result.data.id;
+      update(job.id, {
+        outstand_media_id: mediaId,
+        outstand_upload_done: 0,
+        progress: 10,
+      });
+      const stream = createReadStream(job.file);
+      try {
+        const response = await providerFetch(url, {
           method: "PUT",
           headers: {
-            Authorization: `Bearer ${await access(job.user_id, force)}`,
-            ...headers,
-          },
-          ...(body ? { body } : {}),
-        });
-      let response = await call(false);
-      if (response.status === 401) response = await call(true);
-      return response;
-    };
-    // Query the server before resuming, including after an ambiguous network failure.
-    let response = await send({
-      "Content-Length": "0",
-      "Content-Range": `bytes */${job.size}`,
-    });
-    if ([200, 201].includes(response.status))
-      return setVideo(job, (await response.json()).id);
-    if (response.status !== 308)
-      throw new Error(
-        "The upload session is unavailable. Check your channel before retrying; no replacement upload was created.",
-      );
-    let start = offset(response, job.size);
-    const file = await open(job.file, "r");
-    try {
-      while (start < job.size) {
-        const end = Math.min(start + 8 * 1024 * 1024, job.size);
-        const buffer = Buffer.alloc(end - start);
-        const { bytesRead } = await file.read(buffer, 0, buffer.length, start);
-        if (bytesRead !== buffer.length)
-          throw new Error("The private upload copy is incomplete.");
-        response = await send(
-          {
             "Content-Type": "video/mp4",
-            "Content-Length": String(buffer.length),
-            "Content-Range": `bytes ${start}-${end - 1}/${job.size}`,
+            "Content-Length": String(job.size),
           },
-          buffer,
-        );
-        if ([200, 201].includes(response.status))
-          return setVideo(job, (await response.json()).id);
-        if (response.status !== 308)
-          throw new Error(
-            "YouTube paused the upload. Retry to resume the same session.",
+          body: stream,
+          duplex: "half",
+          signal: AbortSignal.timeout(300000),
+        });
+        await response.body?.cancel();
+        if (!response.ok)
+          throw new HttpError(
+            502,
+            "Outstand media transfer failed. Retry to upload this export again.",
           );
-        const next = offset(response, job.size);
-        if (next <= start)
-          throw new Error(
-            "YouTube did not accept the upload chunk. Retry to resume.",
-          );
-        start = next;
-        db.prepare(
-          "UPDATE publications SET progress=?,updated=? WHERE id=?",
-        ).run(
-          Math.floor((start / job.size) * 90),
-          new Date().toISOString(),
-          job.id,
-        );
+      } finally {
+        stream.destroy();
       }
-      throw new Error(
-        "YouTube has not confirmed completion. Retry to check the existing session.",
+      update(job.id, { outstand_upload_done: 1, progress: 70 });
+    }
+    const result = await api(`/media/${encodeURIComponent(mediaId)}/confirm`, {
+        method: "POST",
+        body: JSON.stringify({ size: job.size }),
+      }),
+      media = result.data || result;
+    if (media.status !== "active" || typeof media.url !== "string")
+      throw new HttpError(
+        502,
+        "Outstand has not confirmed the uploaded media.",
       );
-    } finally {
-      await file.close();
-    }
+    const url = mediaURL(media.url);
+    update(job.id, { outstand_media_url: url, progress: 80 });
+    return url;
   }
-  let processing = false;
-  async function drain() {
-    if (processing || !configured) return;
-    processing = true;
-    try {
-      let job;
-      while (
-        (job = db
-          .prepare(
-            "SELECT * FROM publications WHERE status='queued' ORDER BY created LIMIT 1",
-          )
-          .get())
-      ) {
-        db.prepare(
-          "UPDATE publications SET status='uploading',error=NULL,updated=? WHERE id=?",
-        ).run(new Date().toISOString(), job.id);
-        try {
-          await upload(job);
-        } catch (e) {
-          db.prepare(
-            "UPDATE publications SET status='failed',error=?,updated=? WHERE id=?",
-          ).run(
-            e instanceof HttpError || /^(The |YouTube |Google )/.test(e.message)
-              ? e.message
-              : "Upload interrupted. Retry to resume the same YouTube session.",
-            new Date().toISOString(),
-            job.id,
-          );
-        }
-      }
-    } finally {
-      processing = false;
+  function target(post, job) {
+    if (
+      !post ||
+      post.id !== job.outstand_post_id ||
+      post.socialAccounts?.length !== 1 ||
+      post.socialAccounts[0].id !== job.channel_id ||
+      post.socialAccounts[0].network !== "youtube"
+    )
+      throw new HttpError(
+        502,
+        "Outstand did not confirm the exact requested YouTube destination. No additional destinations are authorized.",
+      );
+    return post.socialAccounts[0];
+  }
+  function resultStatus(job, post) {
+    const account = target(post, job);
+    if (account.status === "published" && account.platformPostId) {
+      update(job.id, {
+        status: "published",
+        progress: 100,
+        video_id: String(account.platformPostId),
+        publish_at: post.scheduledAt || null,
+        error: null,
+        outstand_activated: 1,
+        outstand_retry: 0,
+      });
+      return;
     }
+    if (account.status === "failed") {
+      const code = String(account.error || "").match(
+        /release_pending|org_limit_reached|daily_limit_reached|provider_quota_exhausted|quota_unavailable/,
+      )?.[0];
+      throw new HttpError(
+        409,
+        `Outstand reported a failed YouTube publication${code ? ` (${code})` : ""}. Inspect the Outstand dashboard before retrying.`,
+      );
+    }
+    if (post.isDraft)
+      throw new HttpError(
+        409,
+        "This post is a draft in Outstand. Retry explicitly to resume publishing.",
+      );
+    update(job.id, {
+      status:
+        post.scheduledAt && Date.parse(post.scheduledAt) > Date.now()
+          ? "scheduled"
+          : "waiting",
+      progress: 95,
+      error: null,
+      outstand_activated: 1,
+      outstand_retry: 0,
+      publish_at: post.scheduledAt || null,
+    });
+  }
+  async function loadPost(job) {
+    return (await api(`/posts/${encodeURIComponent(job.outstand_post_id)}`))
+      .post;
+  }
+  function finishReplacement(job) {
+    update(job.id, {
+      outstand_history: JSON.stringify([
+        ...JSON.parse(job.outstand_history || "[]"),
+        job.outstand_recreate,
+      ]),
+      outstand_post_id: null,
+      outstand_request: null,
+      outstand_create_at: null,
+      outstand_recreate: null,
+      outstand_activated: 0,
+      outstand_attempt: job.outstand_attempt + 1,
+    });
+    return get(job.id, job.user_id);
+  }
+  async function processJob(job) {
+    assertChannel(job);
+    if (job.outstand_recreate) {
+      try {
+        const post = await loadPost(job),
+          account = target(post, job);
+        if (
+          account.status !== "failed" ||
+          post.publishedAt ||
+          account.platformPostId
+        )
+          throw new HttpError(
+            409,
+            "Outstand no longer reports a wholly failed post. Check the dashboard before retrying.",
+          );
+        await api(`/posts/${encodeURIComponent(job.outstand_recreate)}`, {
+          method: "DELETE",
+        });
+      } catch (error) {
+        if (error.providerStatus !== 404) throw error;
+      }
+      job = finishReplacement(job);
+    }
+    if (job.outstand_post_id) {
+      const post = await loadPost(job),
+        account = target(post, job);
+      if (
+        account.status === "failed" &&
+        job.outstand_retry &&
+        !post.publishedAt &&
+        !account.platformPostId
+      ) {
+        update(job.id, { outstand_recreate: job.outstand_post_id });
+        return processJob(get(job.id, job.user_id));
+      }
+      if (!post.isDraft) {
+        if (
+          job.outstand_retry &&
+          job.publish_at &&
+          post.scheduledAt !== job.publish_at &&
+          account.status === "pending" &&
+          !post.publishedAt
+        ) {
+          schedule(job.publish_at);
+          await api(`/posts/${encodeURIComponent(job.outstand_post_id)}`, {
+            method: "PATCH",
+            body: JSON.stringify({
+              scheduledAt: job.publish_at,
+              isDraft: false,
+            }),
+          });
+          return resultStatus(job, await loadPost(job));
+        }
+        return resultStatus(job, post);
+      }
+      if (job.outstand_activated && !job.outstand_retry)
+        throw new HttpError(
+          409,
+          "This post was paused in Outstand. Retry explicitly to resume it.",
+        );
+    } else {
+      const url = await prepareMedia(job);
+      job = get(job.id, job.user_id);
+      if (!job.outstand_request) {
+        const request = {
+          containers: [
+            {
+              content: job.description || job.title,
+              media: [{ url, filename: `${job.id}.mp4` }],
+            },
+          ],
+          accounts: [job.channel_id],
+          isDraft: true,
+          ...(job.publish_at ? { scheduledAt: job.publish_at } : {}),
+          youtube: {
+            title: job.title,
+            privacyStatus: job.privacy,
+            madeForKids: !!job.made_for_kids,
+            containsSyntheticMedia: !!job.synthetic,
+          },
+        };
+        update(job.id, {
+          outstand_request: JSON.stringify(request),
+          outstand_create_at: Date.now(),
+          progress: 85,
+        });
+        job = get(job.id, job.user_id);
+      }
+      if (Date.now() - job.outstand_create_at >= 23 * 3600000)
+        throw new HttpError(
+          409,
+          "The Outstand idempotency recovery window expired. Inspect its dashboard before creating another export; this job will not create a replacement post.",
+        );
+      const result = await api(
+        "/posts",
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": `${job.id}-${job.outstand_attempt}` },
+          body: job.outstand_request,
+        },
+        true,
+      );
+      if (typeof result.post?.id !== "string")
+        throw new HttpError(502, "Outstand did not return a post identifier.");
+      update(job.id, {
+        outstand_post_id: result.post.id,
+        progress: 90,
+        status: "finishing",
+      });
+      job = get(job.id, job.user_id);
+      const post = await loadPost(job);
+      target(post, job);
+      if (!post.isDraft) return resultStatus(job, post);
+    }
+    if (job.publish_at && Date.parse(job.publish_at) < Date.now() + 60000)
+      throw new HttpError(
+        409,
+        "The publishing time was missed during preparation. Retry with a future time; this draft will not publish immediately.",
+      );
+    const result = await api(
+      `/posts/${encodeURIComponent(job.outstand_post_id)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          isDraft: false,
+          ...(job.publish_at ? { scheduledAt: job.publish_at } : {}),
+        }),
+      },
+    );
+    if (result.scheduled === false && result.rescheduled !== true)
+      throw new HttpError(
+        502,
+        "Outstand did not confirm that publishing was queued. Inspect the existing post before retrying.",
+      );
+    update(job.id, { outstand_activated: 1 });
+    resultStatus(job, await loadPost(job));
   }
   const locks = new Set();
+  const jobLocks = new Set();
   async function publish(uid, body) {
     ready();
-    if (!connection(uid)) throw new HttpError(400, "Connect a channel first.");
+    const channel = connection(uid);
+    if (!channel)
+      throw new HttpError(
+        400,
+        "Connect a YouTube channel through Outstand first.",
+      );
     const project = find(String(body.projectId || ""), uid);
     if (!project) throw new HttpError(404, "Project not found.");
     if (project.status !== "succeeded" || !project.file || project.dirty)
@@ -500,32 +642,23 @@ export function installYouTube({
       );
     if (!["private", "unlisted", "public"].includes(body.privacy))
       throw new HttpError(400, "Choose a valid privacy setting.");
-    const title = String(body.title || project.title || "My video").trim();
+    const title = String(body.title || project.title || "My video").trim(),
+      description = String(body.description || "").trim();
     if (!title || title.length > 100 || /[<>]/.test(title))
       throw new HttpError(
         400,
-        "YouTube titles need 1–100 characters and cannot contain angle brackets.",
+        "YouTube titles need 1–100 characters without angle brackets.",
       );
-    const description = String(body.description || "").trim();
     if (description.length > 5000 || /[<>]/.test(description))
       throw new HttpError(
         400,
-        "Descriptions can contain up to 5,000 characters, without angle brackets.",
+        "Descriptions need up to 5,000 characters without angle brackets.",
       );
-    let publishAt = null;
-    if (body.publishAt) {
-      const date = Date.parse(body.publishAt);
-      if (!Number.isFinite(date) || date < Date.now() + 600000)
-        throw new HttpError(
-          400,
-          "Schedule at least ten minutes in the future.",
-        );
-      publishAt = new Date(date).toISOString();
-    }
+    const publishAt = schedule(body.publishAt);
     if (body.confirmed !== true)
       throw new HttpError(
         400,
-        "Confirm your upload and publishing choices before continuing.",
+        "Confirm uploading to Outstand media storage and your publishing choices.",
       );
     const key = `${uid}:${project.id}:${project.exports}`;
     if (
@@ -538,26 +671,35 @@ export function installYouTube({
     )
       throw new HttpError(
         409,
-        "This export already has a publication. Retry the existing job or export a new version.",
+        "This export already has a publication. Retry it or export a new version.",
       );
     locks.add(key);
     const id = randomUUID(),
-      file = path.join(root, "youtube", `${id}.mp4`);
+      file = path.join(root, "publishing", `${id}.mp4`);
     try {
       if (
         db
           .prepare(
-            "SELECT count(*) AS n FROM publications WHERE status IN ('queued','uploading','finishing')",
+            "SELECT count(*) AS n FROM publications WHERE provider='outstand' AND status IN ('queued','uploading','finishing')",
           )
           .get().n >= 20
       )
         throw new HttpError(429, "The upload queue is full. Try again later.");
+      await ownedAccount(uid, channel.account_id);
       await mkdir(path.dirname(file), { recursive: true });
       await copyFile(path.join(root, project.file), file);
-      const size = (await stat(file)).size;
-      const now = new Date().toISOString();
+      const size = (await stat(file)).size,
+        now = new Date().toISOString();
+      if (
+        db
+          .prepare(
+            "SELECT count(*) AS n FROM publications WHERE provider='outstand' AND status IN ('queued','uploading','finishing')",
+          )
+          .get().n >= 20
+      )
+        throw new HttpError(429, "The upload queue is full. Try again later.");
       db.prepare(
-        "INSERT INTO publications(id,user_id,project_id,version,title,description,privacy,publish_at,made_for_kids,synthetic,status,progress,file,size,upload_url,video_id,error,created,updated,channel_id) VALUES(?,?,?,?,?,?,?,?,?,?,'queued',0,?,?,NULL,NULL,NULL,?,?,?)",
+        "INSERT INTO publications(id,user_id,project_id,version,title,description,privacy,publish_at,made_for_kids,synthetic,status,progress,file,size,created,updated,channel_id,provider) VALUES(?,?,?,?,?,?,?,?,?,?,'queued',0,?,?,?,?,?,'outstand')",
       ).run(
         id,
         uid,
@@ -573,16 +715,55 @@ export function installYouTube({
         size,
         now,
         now,
-        connection(uid).channel_id,
+        channel.account_id,
       );
       setImmediate(() => void drain());
       return safeJob(get(id, uid));
-    } catch (e) {
+    } catch (error) {
       await unlink(file).catch(() => {});
-      throw e;
+      throw error;
     } finally {
       locks.delete(key);
     }
+  }
+  function retry(uid, id, publishAt) {
+    ready();
+    const job = get(id, uid);
+    if (!job) throw new HttpError(404, "Publication not found.");
+    if (jobLocks.has(id))
+      throw new HttpError(
+        409,
+        "This publication is being checked. Try again shortly.",
+      );
+    if (job.provider !== "outstand")
+      throw new HttpError(
+        409,
+        "Manage legacy Google publications in YouTube Studio.",
+      );
+    if (job.status !== "failed")
+      throw new HttpError(409, "Only failed publications can be retried.");
+    assertChannel(job);
+    const next = publishAt ? schedule(publishAt) : job.publish_at;
+    // publish_at holds the newly requested time. The saved draft-creation body
+    // stays byte-identical for idempotent recovery; activation applies this time
+    // only after the original post ID is recovered and its destination checked.
+    if (
+      !job.outstand_post_id &&
+      job.outstand_create_at &&
+      Date.now() - job.outstand_create_at >= 23 * 3600000
+    )
+      throw new HttpError(
+        409,
+        "The idempotency recovery window expired. Check Outstand before creating another export.",
+      );
+    update(id, {
+      status: "queued",
+      error: null,
+      outstand_retry: 1,
+      publish_at: next,
+    });
+    setImmediate(() => void drain());
+    return safeJob(get(id, uid));
   }
   app.post("/api/youtube/publish", auth, requireVerified, async (req, res) =>
     res.status(202).json(await publish(req.user.id, req.body)),
@@ -591,88 +772,133 @@ export function installYouTube({
     "/api/youtube/publications/:id/retry",
     auth,
     requireVerified,
-    (req, res) => {
-      ready();
-      const job = get(req.params.id, req.user.id);
-      if (!job) throw new HttpError(404, "Publication not found.");
-      if (job.status !== "failed")
-        throw new HttpError(409, "Only interrupted uploads can be retried.");
-      if (connection(req.user.id)?.channel_id !== job.channel_id)
-        throw new HttpError(
-          409,
-          "Reconnect the original channel before retrying this publication.",
-        );
-      db.prepare(
-        "UPDATE publications SET status='queued',error=NULL WHERE id=?",
-      ).run(job.id);
-      res.status(202).json(safeJob(get(job.id, req.user.id)));
-      void drain();
-    },
+    (req, res) =>
+      res
+        .status(202)
+        .json(retry(req.user.id, req.params.id, req.body.publishAt)),
   );
   app.post(
     "/api/youtube/publications/:id/cancel-schedule",
     auth,
     async (req, res) => {
+      ready();
       const job = get(req.params.id, req.user.id);
       if (!job) throw new HttpError(404, "Publication not found.");
+      if (job.provider !== "outstand")
+        throw new HttpError(
+          409,
+          "Manage legacy Google schedules in YouTube Studio.",
+        );
       if (
-        job.status !== "scheduled" ||
-        !job.video_id ||
-        Date.parse(job.publish_at) <= Date.now()
+        !job.outstand_post_id ||
+        !job.publish_at ||
+        Date.parse(job.publish_at) < Date.now() + 60000 ||
+        !["scheduled", "waiting", "failed"].includes(job.status)
       )
         throw new HttpError(
           409,
-          "This publication is no longer scheduled. Manage it in YouTube Studio.",
+          "This publication is not safely cancellable here. Check Outstand and YouTube Studio.",
         );
-      if (connection(req.user.id)?.channel_id !== job.channel_id)
+      assertChannel(job);
+      if (jobLocks.has(job.id))
         throw new HttpError(
           409,
-          "Reconnect the original channel before changing this schedule.",
+          "This publication is being checked. Try again shortly.",
         );
-      // Omitting publishAt in a full status update removes the scheduled time.
-      await youtube(req.user.id, "/videos?part=status", {
-        id: job.video_id,
-        status: {
-          privacyStatus: "private",
-          selfDeclaredMadeForKids: !!job.made_for_kids,
-          containsSyntheticMedia: !!job.synthetic,
-        },
-      });
-      db.prepare(
-        "UPDATE publications SET status='published',privacy='private',publish_at=NULL,updated=? WHERE id=?",
-      ).run(new Date().toISOString(), job.id);
+      jobLocks.add(job.id);
+      try {
+        const post = await loadPost(job),
+          account = target(post, job);
+        if (
+          post.publishedAt ||
+          account.platformPostId ||
+          account.status === "published"
+        )
+          throw new HttpError(
+            409,
+            "This video was already published. Manage it in YouTube Studio.",
+          );
+        await api(`/posts/${encodeURIComponent(job.outstand_post_id)}`, {
+          method: "DELETE",
+        });
+      } catch (error) {
+        if (error.providerStatus !== 404) throw error;
+      } finally {
+        jobLocks.delete(job.id);
+      }
+      update(job.id, { status: "cancelled", error: null });
+      await cleanupCompleted();
       res.json(safeJob(get(job.id, req.user.id)));
     },
   );
-  db.prepare(
-    "UPDATE publications SET status='queued' WHERE status IN ('uploading','finishing')",
-  ).run();
-  setImmediate(() => void drain());
-  function retry(uid, id, publishAt) {
-    ready();
-    const job = get(id, uid);
-    if (!job) throw new HttpError(404, "Publication not found.");
-    if (job.status !== "failed")
-      throw new HttpError(409, "Only interrupted uploads can be retried.");
-    if (connection(uid)?.channel_id !== job.channel_id)
-      throw new HttpError(
-        409,
-        "Reconnect the original channel before retrying this publication.",
-      );
-    if (
-      publishAt &&
-      (!Number.isFinite(Date.parse(publishAt)) ||
-        Date.parse(publishAt) < Date.now() + 600000)
-    )
-      throw new HttpError(
-        400,
-        "Choose a publishing time at least ten minutes from now.",
-      );
-    db.prepare(
-      "UPDATE publications SET status='queued',error=NULL,publish_at=? WHERE id=?",
-    ).run(publishAt ? new Date(publishAt).toISOString() : job.publish_at, id);
-    setImmediate(() => void drain());
-    return safeJob(get(id, uid));
+  let processing = false;
+  async function drain() {
+    if (processing) return;
+    processing = true;
+    try {
+      // Also retry cleanup after restarts or when provider credentials are absent.
+      await cleanupCompleted();
+      if (!configured) return;
+      const interval = process.env.NODE_ENV === "test" ? 200 : 15000;
+      const jobs = db
+        .prepare(
+          "SELECT * FROM publications WHERE provider='outstand' AND (status='queued' OR (status IN ('waiting','scheduled') AND outstand_last_poll<? AND (publish_at IS NULL OR publish_at<? OR outstand_last_poll<?))) ORDER BY created LIMIT 20",
+        )
+        .all(
+          Date.now() - interval,
+          new Date(Date.now() + 60000).toISOString(),
+          Date.now() - (process.env.NODE_ENV === "test" ? 200 : 300000),
+        );
+      for (const snapshot of jobs) {
+        // A user may cancel while another job in this batch awaits the network.
+        const job = get(snapshot.id, snapshot.user_id);
+        if (!job || !["queued", "waiting", "scheduled"].includes(job.status))
+          continue;
+        if (jobLocks.has(job.id)) continue;
+        jobLocks.add(job.id);
+        update(job.id, {
+          outstand_last_poll: Date.now(),
+          ...(job.status === "queued"
+            ? { status: "uploading", error: null }
+            : {}),
+        });
+        try {
+          if (["waiting", "scheduled"].includes(job.status))
+            resultStatus(job, await loadPost(job));
+          else await processJob(job);
+        } catch (error) {
+          const polling = ["waiting", "scheduled"].includes(job.status),
+            terminal = error.status === 409 || error.providerStatus === 404;
+          update(job.id, {
+            status: polling && !terminal ? job.status : "failed",
+            error:
+              error instanceof HttpError
+                ? error.message
+                : "Outstand processing was interrupted. Retry the existing job; no replacement post has been authorized.",
+          });
+        } finally {
+          jobLocks.delete(job.id);
+        }
+      }
+      await cleanupCompleted();
+    } finally {
+      processing = false;
+    }
   }
-  return { configured, publish, retry };
+  db.prepare(
+    "UPDATE publications SET status='queued' WHERE provider='outstand' AND status IN ('uploading','finishing')",
+  ).run();
+  const timer = setInterval(
+    () => void drain().catch(() => {}),
+    process.env.NODE_ENV === "test" ? 300 : 15000,
+  );
+  timer.unref();
+  setImmediate(() => void drain());
+  return {
+    configured,
+    provider: "outstand",
+    hasConnection: (uid) => !!connection(uid),
+    publish,
+    retry,
+  };
 }

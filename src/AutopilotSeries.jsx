@@ -21,6 +21,7 @@ export default function AutopilotSeries({ user, notify }) {
     [aspect, setAspect] = useState("16:9"),
     [background, setBackground] = useState("mountains"),
     [voice, setVoice] = useState("slt"),
+    [privacy, setPrivacy] = useState("private"),
     [confirmed, setConfirmed] = useState(false),
     [kids, setKids] = useState(false),
     [synthetic, setSynthetic] = useState(true),
@@ -63,6 +64,7 @@ export default function AutopilotSeries({ user, notify }) {
         captions: true,
         graphics: true,
         music: false,
+        privacy,
       },
       madeForKids: kids,
       synthetic,
@@ -140,6 +142,17 @@ export default function AutopilotSeries({ user, notify }) {
               </select>
             </label>
             <label>
+              Publication visibility
+              <select
+                value={privacy}
+                onChange={(e) => setPrivacy(e.target.value)}
+              >
+                <option value="private">Private</option>
+                <option value="unlisted">Unlisted</option>
+                <option value="public">Public</option>
+              </select>
+            </label>
+            <label>
               Format
               <select
                 value={aspect}
@@ -205,7 +218,9 @@ export default function AutopilotSeries({ user, notify }) {
               checked={confirmed}
               onChange={(e) => setConfirmed(e.target.checked)}
             />
-            I authorize generation credit use and automatic scheduled publishing
+            I authorize generation credit use, transfer to Outstand media
+            storage (public media URLs retained for up to 60 days), and
+            automatic scheduled publishing as {privacy}
             for these topics, and have reviewed their suitability and rights.
           </label>
           <button

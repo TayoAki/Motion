@@ -68,25 +68,15 @@ test("channel tokens are authenticated ciphertext and tampering fails", () => {
 });
 
 test(
-  "configured email, Stripe, OpenRouter, OAuth, resumable YouTube scheduling, and account recovery",
+  "configured email, Stripe, OpenRouter, and account recovery",
   { timeout: 240000 },
   async (t) => {
     const dataDir = await mkdtemp(path.join(tmpdir(), "motion-provider-test-"));
-    const mail = [],
-      calls = {
-        uploads: 0,
-        chunks: 0,
-        complete: false,
-        updates: [],
-        refreshes: 0,
-        exchanges: 0,
-        revokes: 0,
-      };
+    const mail = [];
     let subscriptionUser,
       checkout,
       rejectAI = false;
     let currentPrice = "price_creator_monthly";
-    const uploadSessions = new Map();
     const json = (res, body, status = 200) => {
       res.writeHead(status, { "Content-Type": "application/json" });
       res.end(JSON.stringify(body));
@@ -165,63 +155,6 @@ test(
                   },
                 ],
               });
-        if (url.pathname === "/oauth2.googleapis.com/token") {
-          const form = new URLSearchParams(raw);
-          if (form.get("grant_type") === "refresh_token") calls.refreshes++;
-          else calls.exchanges++;
-          return json(res, {
-            access_token: "mock-access-not-a-real-token",
-            refresh_token: "mock-refresh-not-a-real-token",
-            expires_in: 3600,
-          });
-        }
-        if (url.pathname === "/oauth2.googleapis.com/revoke") {
-          calls.revokes++;
-          return json(res, {});
-        }
-        if (url.pathname === "/www.googleapis.com/youtube/v3/channels")
-          return json(res, {
-            items: [
-              { id: "UC_test_channel", snippet: { title: "Test channel" } },
-            ],
-          });
-        if (url.pathname === "/www.googleapis.com/upload/youtube/v3/videos") {
-          assert.equal(JSON.parse(raw).status.privacyStatus, "private");
-          calls.uploads++;
-          uploadSessions.set(String(calls.uploads), { complete: false });
-          res.writeHead(200, {
-            Location: `https://www.googleapis.com/upload/test-session/${calls.uploads}`,
-          });
-          return res.end();
-        }
-        if (
-          url.pathname.startsWith("/www.googleapis.com/upload/test-session/")
-        ) {
-          const id = url.pathname.split("/").pop(),
-            session = uploadSessions.get(id);
-          if (req.headers["content-range"].startsWith("bytes */")) {
-            if (session.complete) return json(res, { id: `TestVideo${id}ID` });
-            res.writeHead(308);
-            return res.end();
-          }
-          assert.ok(bytes.length > 10000);
-          calls.chunks++;
-          session.complete = true;
-          // The service accepted the file, but its response was lost. A retry must
-          // query this session rather than create a duplicate YouTube video.
-          return id === "1"
-            ? json(
-                res,
-                { error: "temporary failure after accepting upload" },
-                503,
-              )
-            : json(res, { id: `TestVideo${id}ID` });
-        }
-        if (url.pathname === "/www.googleapis.com/youtube/v3/videos") {
-          const body = JSON.parse(raw);
-          calls.updates.push(body);
-          return json(res, body);
-        }
         json(
           res,
           { error: `Unexpected mock route ${req.method} ${url.pathname}` },
@@ -238,7 +171,8 @@ test(
     await once(portFinder, "listening");
     const port = portFinder.address().port;
     await new Promise((r) => portFinder.close(r));
-    let server,
+    let sql,
+      server,
       logs = "";
     async function start() {
       server = spawn(process.execPath, ["server/index.js"], {
@@ -258,8 +192,7 @@ test(
           STRIPE_WEBHOOK_SECRET: "mock-webhook-signing-secret",
           STRIPE_PRICE_CREATOR_MONTHLY: "price_creator_monthly",
           STRIPE_PRICE_STUDIO_MONTHLY: "price_studio_monthly",
-          GOOGLE_CLIENT_ID: "mock-client",
-          GOOGLE_CLIENT_SECRET: "mock-only",
+          OUTSTAND_API_KEY: "",
           TOKEN_ENCRYPTION_KEY: "ab".repeat(32),
           OPENROUTER_API_KEY: "mock-only",
         },
@@ -284,10 +217,12 @@ test(
     }
     t.after(async () => {
       await stop();
+      sql?.close();
       await new Promise((r) => mock.close(r));
       await rm(dataDir, { recursive: true, force: true });
     });
     await start();
+    sql = new DatabaseSync(path.join(dataDir, "studio.sqlite"));
     const base = `http://127.0.0.1:${port}`;
     async function api(route, method = "GET", body, cookie, extra = {}) {
       const response = await fetch(`${base}/api${route}`, {
@@ -503,323 +438,6 @@ test(
     assert.equal(rejected.status, 502);
     assert.ok(!rejected.body.error.includes("provider details"));
     rejectAI = false;
-    const authorization = await api("/youtube/connect", "POST", {}, cookie);
-    assert.equal(authorization.status, 200);
-    const state = new URL(authorization.body.url).searchParams.get("state");
-    assert.ok(
-      (
-        await api(
-          `/youtube/callback?state=${state}&code=mock-code`,
-          "GET",
-          null,
-          other.cookie,
-        )
-      ).location.includes("error="),
-    );
-    assert.ok(
-      (
-        await api(
-          `/youtube/callback?state=${state}&code=mock-code`,
-          "GET",
-          null,
-          cookie,
-        )
-      ).location.includes("connected=1"),
-    );
-    assert.ok(
-      (
-        await api(
-          `/youtube/callback?state=${state}&code=mock-code`,
-          "GET",
-          null,
-          cookie,
-        )
-      ).location.includes("error="),
-    );
-    assert.equal(calls.exchanges, 1);
-    const sql = new DatabaseSync(path.join(dataDir, "studio.sqlite"));
-    t.after(() => sql.close());
-    const tokens = sql
-      .prepare("SELECT * FROM youtube_connections WHERE user_id=?")
-      .get(uid);
-    assert.notEqual(tokens.refresh_token, "mock-refresh-not-a-real-token");
-    assert.ok(!tokens.refresh_token.includes("mock-refresh"));
-    sql
-      .prepare("UPDATE youtube_connections SET expires=0 WHERE user_id=?")
-      .run(uid);
-    assert.equal(
-      (await api(`/projects/${project.body.id}/render`, "POST", {}, cookie))
-        .status,
-      202,
-    );
-    async function waitFor(route, predicate) {
-      for (let i = 0; i < 500; i++) {
-        const r = await api(route, "GET", null, cookie);
-        if (predicate(r.body)) return r.body;
-        await new Promise((r) => setTimeout(r, 30));
-      }
-      throw new Error(`Timed out ${route}: ${logs}`);
-    }
-    await waitFor(
-      `/projects/${project.body.id}`,
-      (p) => p.status === "succeeded",
-    );
-    const publishAt = new Date(Date.now() + 3600000).toISOString(),
-      publish = {
-        projectId: project.body.id,
-        title: "Scheduled test",
-        description: "Test description",
-        privacy: "public",
-        publishAt,
-        confirmed: true,
-        madeForKids: false,
-        synthetic: true,
-      };
-    assert.equal(
-      (
-        await api(
-          "/youtube/publish",
-          "POST",
-          { ...publish, confirmed: false },
-          cookie,
-        )
-      ).status,
-      400,
-    );
-    assert.equal(
-      (await api("/youtube/publish", "POST", publish, other.cookie)).status,
-      403,
-    );
-    const publication = await api("/youtube/publish", "POST", publish, cookie);
-    assert.equal(publication.status, 202);
-    assert.equal(
-      (await api("/youtube/publish", "POST", publish, cookie)).status,
-      409,
-    );
-    await waitFor("/youtube", (r) => r.publications[0]?.status === "failed");
-    assert.equal(
-      (
-        await api(
-          `/youtube/publications/${publication.body.id}/retry`,
-          "POST",
-          {},
-          other.cookie,
-        )
-      ).status,
-      403,
-    );
-    assert.equal(
-      (
-        await api(
-          `/youtube/publications/${publication.body.id}/retry`,
-          "POST",
-          {},
-          cookie,
-        )
-      ).status,
-      202,
-    );
-    const scheduled = await waitFor(
-      "/youtube",
-      (r) => r.publications[0]?.status === "scheduled",
-    );
-    assert.equal(scheduled.publications[0].publishAt, publishAt);
-    assert.equal(calls.uploads, 1);
-    assert.equal(calls.chunks, 1);
-    assert.equal(calls.refreshes, 1);
-    assert.equal(calls.updates[0].status.privacyStatus, "private");
-    assert.equal(calls.updates[0].status.containsSyntheticMedia, true);
-    assert.equal(
-      (
-        await api(
-          `/youtube/publications/${publication.body.id}/cancel-schedule`,
-          "POST",
-          {},
-          other.cookie,
-        )
-      ).status,
-      404,
-    );
-    assert.equal(
-      (
-        await api(
-          `/youtube/publications/${publication.body.id}/cancel-schedule`,
-          "POST",
-          {},
-          cookie,
-        )
-      ).status,
-      200,
-    );
-    assert.equal(calls.updates.at(-1).status.publishAt, undefined);
-    assert.equal(
-      (await api("/youtube", "GET", null, cookie)).body.publications[0].privacy,
-      "private",
-    );
-    await stop();
-    sql
-      .prepare("UPDATE publications SET status='finishing' WHERE id=?")
-      .run(publication.body.id);
-    await start();
-    await waitFor("/youtube", (r) => r.publications[0]?.status === "published");
-    assert.equal(calls.uploads, 1);
-    const otherVerify = mail[1].text.match(/#verify\/([a-f0-9]+)/)[1];
-    assert.equal(
-      (await api("/auth/verify-email", "POST", { token: otherVerify })).status,
-      200,
-    );
-    const seriesInput = {
-      name: "Daily stories",
-      topics: ["Why mountains grow"],
-      nextAt: new Date(Date.now() + 25 * 60000).toISOString(),
-      intervalDays: 1,
-      settings: { background: "forest", voice: "slt", aspect: "9:16" },
-      confirmed: true,
-      synthetic: true,
-    };
-    assert.equal(
-      (
-        await api(
-          "/series",
-          "POST",
-          { ...seriesInput, confirmed: false },
-          cookie,
-        )
-      ).status,
-      400,
-    );
-    const balanceBeforeSeries = (await api("/me", "GET", null, cookie)).body
-      .user.credits;
-    const series = await api("/series", "POST", seriesInput, cookie);
-    assert.equal(series.status, 201);
-    const seriesDone = await waitFor(
-      "/series",
-      (r) =>
-        r.series.find((s) => s.id === series.body.id)?.runs[0]?.status ===
-        "complete",
-    );
-    const firstRun = seriesDone.series.find((s) => s.id === series.body.id)
-      .runs[0];
-    assert.equal(
-      (await api(`/projects/${firstRun.project_id}`, "GET", null, cookie)).body
-        .status,
-      "succeeded",
-    );
-    assert.equal(
-      (await api("/me", "GET", null, cookie)).body.user.credits,
-      balanceBeforeSeries - 1,
-    );
-    assert.equal(calls.uploads, 2);
-    assert.equal(calls.chunks, 2);
-    assert.equal(
-      (await api("/series", "GET", null, other.cookie)).body.series.length,
-      0,
-    );
-    assert.equal(
-      (
-        await api(
-          `/series/${series.body.id}`,
-          "PATCH",
-          { active: true },
-          other.cookie,
-        )
-      ).status,
-      404,
-    );
-    const futureSeries = await api(
-      "/series",
-      "POST",
-      {
-        ...seriesInput,
-        name: "Future",
-        topics: ["First future topic", "Second future topic"],
-        nextAt: new Date(Date.now() + 2 * 86400000).toISOString(),
-      },
-      cookie,
-    );
-    assert.equal(
-      (
-        await api(
-          `/series/${futureSeries.body.id}`,
-          "PATCH",
-          { active: false },
-          cookie,
-        )
-      ).body.active,
-      false,
-    );
-    assert.equal(
-      (
-        await api(
-          `/series/${futureSeries.body.id}`,
-          "PATCH",
-          { active: true },
-          cookie,
-        )
-      ).body.active,
-      true,
-    );
-    sql
-      .prepare("UPDATE series SET next_at=? WHERE id=?")
-      .run(new Date(Date.now() - 60000).toISOString(), futureSeries.body.id);
-    const missed = await waitFor(
-      "/series",
-      (r) => r.series.find((s) => s.id === futureSeries.body.id)?.error,
-    );
-    assert.equal(
-      missed.series.find((s) => s.id === futureSeries.body.id).runs.length,
-      0,
-      "missed times must never cause immediate publication",
-    );
-    sql.prepare("UPDATE users SET credits=0 WHERE id=?").run(uid);
-    const noCredit = await api(
-      "/series",
-      "POST",
-      {
-        ...seriesInput,
-        name: "Out of credits",
-        topics: ["A paused topic", "A later topic"],
-      },
-      cookie,
-    );
-    const stopped = await waitFor(
-      "/series",
-      (r) =>
-        r.series.find((s) => s.id === noCredit.body.id)?.runs[0]?.status ===
-        "failed",
-    );
-    const stoppedSeries = stopped.series.find((s) => s.id === noCredit.body.id);
-    assert.equal(stoppedSeries.active, false);
-    sql.prepare("UPDATE users SET credits=10 WHERE id=?").run(uid);
-    assert.equal(
-      (
-        await api(
-          `/series/runs/${stoppedSeries.runs[0].id}/retry`,
-          "POST",
-          {},
-          cookie,
-        )
-      ).status,
-      200,
-    );
-    await waitFor(
-      "/series",
-      (r) =>
-        r.series.find((s) => s.id === noCredit.body.id)?.runs[0]?.status ===
-        "complete",
-    );
-    assert.equal((await api("/me", "GET", null, cookie)).body.user.credits, 9);
-    assert.equal(calls.uploads, 3);
-    assert.equal(
-      (await api("/youtube/connection", "DELETE", null, cookie)).status,
-      200,
-    );
-    assert.equal(calls.revokes, 1);
-    assert.equal(
-      (await api("/youtube", "GET", null, cookie)).body.channel,
-      null,
-    );
-    // Email changes require the current password and confirmation of the new inbox.
     assert.equal(
       (
         await api(

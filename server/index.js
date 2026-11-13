@@ -188,6 +188,7 @@ app.get("/api/health", (_req, res) =>
     scriptAI: !!process.env.OPENROUTER_API_KEY,
     billing: billingService.configured,
     youtube: youtubeService.configured,
+    publishingProvider: youtubeService.provider,
     email: emailService.status(),
     mode: "local-studio",
   }),
