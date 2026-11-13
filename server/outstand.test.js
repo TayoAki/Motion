@@ -456,12 +456,17 @@ test(
         try {
           await stat(file);
         } catch (error) {
-          if (error.code === "ENOENT") return;
-          throw error;
+          if (error.code !== "ENOENT") throw error;
+          // Another process can see unlink before the worker resumes to clear
+          // SQLite metadata. Wait for both parts of cleanup to be durable.
+          if (
+            !sql.prepare("SELECT id FROM publications WHERE file=?").get(file)
+          )
+            return;
         }
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
-      assert.fail(`Publication copy was not removed: ${file}`);
+      assert.fail(`Publication copy cleanup did not finish: ${file}`);
     }
     const job = await publish(p.body.id);
     await publication(job, "failed");
