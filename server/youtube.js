@@ -849,7 +849,11 @@ export function installYouTube({
           new Date(Date.now() + 60000).toISOString(),
           Date.now() - (process.env.NODE_ENV === "test" ? 200 : 300000),
         );
-      for (const job of jobs) {
+      for (const snapshot of jobs) {
+        // A user may cancel while another job in this batch awaits the network.
+        const job = get(snapshot.id, snapshot.user_id);
+        if (!job || !["queued", "waiting", "scheduled"].includes(job.status))
+          continue;
         if (jobLocks.has(job.id)) continue;
         jobLocks.add(job.id);
         update(job.id, {

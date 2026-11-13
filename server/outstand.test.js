@@ -113,6 +113,11 @@ test(
           assert.equal(req.headers["content-type"], "video/mp4");
           assert.ok(bytes.length > 10000);
           calls.puts++;
+          if (holdTransfer) {
+            holdTransfer = false;
+            transferEntered();
+            await new Promise((resolve) => (releaseTransfer = resolve));
+          }
           return json(res, {});
         }
         if (
@@ -243,6 +248,12 @@ test(
       replayEntered,
       releaseReplay;
     const replayReached = new Promise((resolve) => (replayEntered = resolve));
+    let holdTransfer = false,
+      transferEntered,
+      releaseTransfer;
+    const transferReached = new Promise(
+      (resolve) => (transferEntered = resolve),
+    );
     let configuredKey = "mock-outstand-only";
     let server,
       logs = "";
@@ -288,6 +299,7 @@ test(
     let sql;
     t.after(async () => {
       releaseReplay?.();
+      releaseTransfer?.();
       await stop();
       sql?.close();
       mock.closeAllConnections();
@@ -779,6 +791,55 @@ test(
       409,
     );
     assert.equal(calls.creates, creates);
+    const concurrent = await publish(
+      await readyProject("Concurrent cancellation"),
+    );
+    await publication(concurrent, "scheduled");
+    await stop();
+    // On restart the worker snapshots both jobs. Hold its first upload while
+    // the user cancels the second job, before the worker reaches that snapshot.
+    sql
+      .prepare(
+        "UPDATE publications SET status='queued',outstand_retry=1 WHERE id=?",
+      )
+      .run(bad);
+    sql
+      .prepare("UPDATE publications SET outstand_last_poll=0 WHERE id=?")
+      .run(concurrent);
+    holdTransfer = true;
+    await start();
+    await Promise.race([
+      transferReached,
+      new Promise((_, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error("Worker did not start the held upload")),
+          3000,
+        );
+        timer.unref();
+      }),
+    ]);
+    assert.equal(
+      (
+        await api(
+          `/youtube/publications/${concurrent}/cancel-schedule`,
+          "POST",
+          {},
+          cookie,
+        )
+      ).status,
+      200,
+    );
+    releaseTransfer();
+    const resumed = await publication(bad, "waiting");
+    delivered(posts.get(resumed.postId));
+    await publication(bad, "published");
+    assert.equal(
+      (await api("/youtube", "GET", null, cookie)).body.publications.find(
+        (p) => p.id === concurrent,
+      ).status,
+      "cancelled",
+      "cancellation must survive the worker finishing another upload and polling again",
+    );
     const next = await begin();
     sql.prepare("UPDATE outstand_states SET expires=0").run();
     assert.ok(
