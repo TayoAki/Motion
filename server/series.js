@@ -16,6 +16,9 @@ export function installSeries({
 }) {
   db.exec(`CREATE TABLE IF NOT EXISTS series(id TEXT PRIMARY KEY,user_id TEXT REFERENCES users(id),name TEXT,topics TEXT,settings TEXT,interval_days INTEGER,next_at TEXT,active INTEGER,created TEXT,error TEXT);
     CREATE TABLE IF NOT EXISTS series_runs(id TEXT PRIMARY KEY,series_id TEXT REFERENCES series(id),user_id TEXT REFERENCES users(id),scheduled_at TEXT,topic TEXT,project_id TEXT,publication_id TEXT,status TEXT,error TEXT,created TEXT,UNIQUE(series_id,scheduled_at));`);
+  db.prepare(
+    "UPDATE series SET active=0,error='Reconnect through Outstand and confirm the series visibility before resuming.' WHERE active=1 AND user_id NOT IN (SELECT user_id FROM outstand_connections)",
+  ).run();
   const get = (id, uid) =>
     db.prepare("SELECT * FROM series WHERE id=? AND user_id=?").get(id, uid);
   function safe(s) {
@@ -39,13 +42,9 @@ export function installSeries({
     if (!process.env.OPENROUTER_API_KEY || !youtube.configured)
       throw new HttpError(
         503,
-        "Autopilot requires OpenRouter and Google OAuth credentials on the server.",
+        "Autopilot requires OpenRouter and Outstand credentials on the server.",
       );
-    if (
-      !db
-        .prepare("SELECT user_id FROM youtube_connections WHERE user_id=?")
-        .get(uid)
-    )
+    if (!youtube.hasConnection(uid))
       throw new HttpError(400, "Connect your YouTube channel first.");
     if (
       process.env.REQUIRE_EMAIL_VERIFICATION === "1" &&
@@ -100,6 +99,11 @@ export function installSeries({
       musicId: null,
       scenes: [],
     });
+    if (
+      req.body.settings?.privacy &&
+      !["private", "unlisted", "public"].includes(req.body.settings.privacy)
+    )
+      throw new HttpError(400, "Choose a valid publication visibility.");
     const {
       voice,
       background,
@@ -127,6 +131,7 @@ export function installSeries({
         musicVolume,
         madeForKids: !!req.body.madeForKids,
         synthetic: !!req.body.synthetic,
+        privacy: req.body.settings?.privacy || "private",
       }),
       req.body.intervalDays,
       new Date(next).toISOString(),
@@ -230,6 +235,18 @@ export function installSeries({
       for (const s of db
         .prepare("SELECT * FROM series WHERE active=1 AND next_at<=?")
         .all(new Date(Date.now() + 30 * 60000).toISOString())) {
+        if (
+          db
+            .prepare(
+              "SELECT r.id FROM series_runs r LEFT JOIN publications p ON p.id=r.publication_id WHERE r.series_id=? AND r.status IN ('queued','rendering','uploading','scheduled') AND r.scheduled_at<? AND (p.status IS NULL OR p.status<>'published') LIMIT 1",
+            )
+            .get(s.id, new Date().toISOString())
+        ) {
+          db.prepare(
+            "UPDATE series SET active=0,error='A previous publication has no successful outcome yet. Inspect Outstand before resuming future runs.' WHERE id=?",
+          ).run(s.id);
+          continue;
+        }
         if (Date.parse(s.next_at) < Date.now() + 10 * 60000) {
           db.prepare("UPDATE series SET active=0,error=? WHERE id=?").run(
             "Publishing time was missed while the server was unavailable. Create a new future schedule.",
@@ -270,7 +287,7 @@ export function installSeries({
       }
       const runs = db
         .prepare(
-          "SELECT * FROM series_runs WHERE status IN ('queued','rendering','uploading') ORDER BY created",
+          "SELECT * FROM series_runs WHERE status IN ('queued','rendering','uploading','scheduled') ORDER BY created",
         )
         .all();
       for (const run of runs) {
@@ -315,7 +332,7 @@ export function installSeries({
                   projectId: project.id,
                   title: project.title,
                   description: `A video about ${run.topic}.`,
-                  privacy: "private",
+                  privacy: settings.privacy || "private",
                   publishAt: run.scheduled_at,
                   confirmed: true,
                   madeForKids: settings.madeForKids,
@@ -331,9 +348,13 @@ export function installSeries({
                 "SELECT status,error FROM publications WHERE id=? AND user_id=?",
               )
               .get(run.publication_id, run.user_id);
-            if (!job || job.status === "failed")
+            if (!job || ["failed", "cancelled", "blocked"].includes(job.status))
               throw new Error(job?.error || "Publication not found.");
-            if (["scheduled", "published"].includes(job.status))
+            if (job.status === "scheduled")
+              db.prepare(
+                "UPDATE series_runs SET status='scheduled',error=NULL WHERE id=?",
+              ).run(run.id);
+            if (job.status === "published")
               db.prepare(
                 "UPDATE series_runs SET status='complete',error=NULL WHERE id=?",
               ).run(run.id);

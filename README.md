@@ -27,20 +27,20 @@ For development, run `npm run api` and `npm run dev` in separate terminals, then
 5. Save a draft or generate a video. A persisted queue tracks real rendering progress. Cancelling or failing returns the reserved credits.
 6. Review the actual video, select scenes, edit narration, replace scene backgrounds, and change export settings.
 7. Save changes and update the export, then download the 1080p H.264/AAC MP4 or editable JSON manifest.
-8. Connect a YouTube channel, upload an export, or schedule a future publication. Uploads start private, use resumable sessions, and can recover after an interruption without uploading a duplicate video.
+8. Connect a YouTube channel through Outstand, choose visibility, and publish an export immediately or schedule delivery up to 30 days ahead. Persisted draft creation and idempotency protect retries; actual YouTube delivery is polled separately from queue acceptance.
 9. Enable an Autopilot series: supply topics, a first publishing time, and a daily/weekly interval. Each run writes a script, renders a video, and schedules it on YouTube. Failures pause future runs; late schedules are never published immediately.
 10. Choose a Stripe subscription, see paid-invoice credit allowances and receipts, and manage or cancel your subscription through the billing portal.
 11. Verify email, change an email/password, recover an account, browse credit history, create thumbnail PNGs, or manage REST/MCP API keys.
 
 The renderer uses curated still images with slow camera movement, local Flite speech, approximate timed captions, an opening title, and optional ambient sound or uploaded music. This version does **not** automatically find stock footage or create AI video clips. Caption timing is estimated from narration length, not word-level speech alignment.
 
-Local limits: 8,000 script characters, 10-minute narration/music uploads, 100 MB per file, one render worker. Generation costs one credit per estimated 15 seconds; re-rendering an existing export costs four. Downloading an existing file is free. No media expiry is imposed.
+Local limits: 8,000 script characters, 10-minute narration/music uploads, 100 MB per file, one render worker. Generation costs one credit per estimated 15 seconds; re-rendering an existing export costs four. Downloading an existing file is free. Local media has no automatic expiry. Publishing transfers the MP4 to Outstand's public media storage, retained for up to 60 days, including for private YouTube videos.
 
 ## Optional AI script writing
 
 Provide `OPENROUTER_API_KEY` securely in the **server** environment, or in an uncommitted `.env` based on `.env.example`. The default model is `openai/gpt-4o-mini`; change it with `OPENROUTER_MODEL`.
 
-Without a key, Script studio explicitly creates a topic-based starter template. Autopilot requires the AI provider and a connected YouTube channel. The OpenRouter, Stripe, Resend, and Google flows are exercised against isolated local provider mocks; no live charges, emails, or YouTube uploads have been made during automated verification.
+Without a key, Script studio explicitly creates a topic-based starter template. Autopilot requires the AI provider and an Outstand-connected YouTube channel. Outstand needs an active subscription and server-side `OUTSTAND_API_KEY`; a separate Google OAuth application is unnecessary. The OpenRouter, Stripe, Resend, and Outstand flows are exercised against isolated local provider mocks; no live charges, emails, or YouTube posts have been made during automated verification.
 
 ## Activate provider accounts
 
@@ -75,7 +75,7 @@ Use the returned project ID:
 | POST | `/api/billing/checkout` | Open a configured hosted subscription checkout |
 | POST | `/api/billing/portal` | Open subscription management/cancellation |
 | POST | `/api/billing/webhook` | Receive raw, signature-verified Stripe events |
-| POST | `/api/youtube/connect` | Start session-bound Google authorization |
+| POST | `/api/youtube/connect` | Start session-bound Outstand YouTube authorization |
 | POST | `/api/youtube/publish` | Queue an owned, clean export for upload/scheduling |
 | GET | `/api/youtube` | Read the connected channel and private publication history |
 | POST | `/api/series` | Create a confirmed, credit-consuming recurring series |
@@ -92,7 +92,7 @@ Tools: `project_list`, `project_get`, `project_create`, `project_render`, `proje
 
 ## Persistence and deployment
 
-`data/studio.sqlite` stores accounts, hashed sessions/API keys and action tokens, uploads, projects, scripts, credit events, billing events, encrypted Google tokens, resumable upload sessions, and Autopilot schedules. Uploaded audio and exports live under `data/`. Back up the directory and the separate token-encryption secret. `DATA_DIR` changes the directory. Interrupted renders are marked failed and their reservations refunded on startup; interrupted uploads resume the saved session. Autopilot runs 30 minutes before each scheduled time while this server is running.
+`data/studio.sqlite` stores accounts, hashed sessions/API keys and action tokens, projects, credits, billing events, Outstand account/post/media IDs, exact idempotent requests, and Autopilot schedules. Uploaded audio and exports live under `data/`. Back up this directory; `DATA_DIR` changes its location. Interrupted renders fail and refund their reservations on startup. Interrupted Outstand jobs recover their saved draft/post instead of blindly submitting again. Autopilot prepares videos up to 30 minutes before each scheduled delivery while this server runs. Historical Google records are retained but are never processed by the Outstand worker; manage existing Google schedules in YouTube Studio and reconnect before resuming old series.
 
 This is a single-process application. Before exposing it publicly, configure HTTPS (`COOKIE_SECURE=1` behind a trusted reverse proxy), production provider credentials, storage lifecycle/quotas, monitoring, and backups. Set `NODE_ENV=production`, `DEV_EMAIL_PREVIEW=0`, and `REQUIRE_EMAIL_VERIFICATION=1` after configuring email delivery. Do not run multiple API workers against this in-process render/upload/Autopilot queue. A distributed worker architecture remains a separate scaling project.
 
@@ -107,7 +107,7 @@ npm audit --omit=dev
 
 Tests generate real landscape and portrait MP4s and inspect their streams with ffprobe. They exercise uploaded narration, all four voice previews, account isolation, login/logout, duplicate job prevention, cancellation/refunds, re-export charging, restart recovery, and API key revocation. Test accounts and exports use an isolated temporary database and are cleaned up.
 
-Provider tests additionally check signature freshness and tampering, duplicate paid-invoice delivery, no credits from checkout redirects, OAuth state ownership/replay, encrypted tokens, refresh/revocation, lost upload responses and resume, scheduled-video cancellation, recurring series creation/render/upload, pause/resume, missed times, insufficient-credit recovery, single-use verification and password reset, email changes, session/key revocation, and MCP ownership. Paid production services and full browser acceptance tests have not been exercised.
+Provider tests additionally check Stripe signature freshness and invoice deduplication, account verification/recovery and revocation, Outstand tenant/state ownership, actual MP4 transfer, identical retries after lost creation responses, lost activation-response recovery, private/unlisted/public payloads, schedule cancellation, pending versus published outcomes, quota failure/retry, expired recovery windows, invalid media hosts, legacy job blocking, and Autopilot delivery/retry without duplicate render charges. Paid production services and full browser acceptance tests have not been exercised.
 
 ## REA and assets
 
