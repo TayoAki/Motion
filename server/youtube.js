@@ -68,6 +68,29 @@ export function installYouTube({
         .join(",")} WHERE id=?`,
     ).run(...Object.values(fields), id);
   }
+  async function cleanupCompleted() {
+    const completed = db
+      .prepare(
+        "SELECT id,file FROM publications WHERE provider='outstand' AND status IN ('published','cancelled') AND file IS NOT NULL LIMIT 100",
+      )
+      .all();
+    for (const job of completed) {
+      // Delete only the private publication copy, never a project's original export.
+      if (
+        path.resolve(job.file) !==
+        path.resolve(root, "publishing", `${job.id}.mp4`)
+      )
+        continue;
+      try {
+        await unlink(job.file);
+      } catch (error) {
+        if (error.code !== "ENOENT") continue;
+      }
+      db.prepare(
+        "UPDATE publications SET file=NULL WHERE id=? AND file=? AND provider='outstand' AND status IN ('published','cancelled')",
+      ).run(job.id, job.file);
+    }
+  }
   const safeJob = (j) => ({
     id: j.id,
     projectId: j.project_id,
@@ -721,15 +744,9 @@ export function installYouTube({
       throw new HttpError(409, "Only failed publications can be retried.");
     assertChannel(job);
     const next = publishAt ? schedule(publishAt) : job.publish_at;
-    if (
-      !job.outstand_post_id &&
-      job.outstand_request &&
-      next !== job.publish_at
-    )
-      throw new HttpError(
-        409,
-        "Recover the original Outstand draft before changing its time.",
-      );
+    // publish_at holds the newly requested time. The saved draft-creation body
+    // stays byte-identical for idempotent recovery; activation applies this time
+    // only after the original post ID is recovered and its destination checked.
     if (
       !job.outstand_post_id &&
       job.outstand_create_at &&
@@ -810,14 +827,18 @@ export function installYouTube({
         jobLocks.delete(job.id);
       }
       update(job.id, { status: "cancelled", error: null });
+      await cleanupCompleted();
       res.json(safeJob(get(job.id, req.user.id)));
     },
   );
   let processing = false;
   async function drain() {
-    if (processing || !configured) return;
+    if (processing) return;
     processing = true;
     try {
+      // Also retry cleanup after restarts or when provider credentials are absent.
+      await cleanupCompleted();
+      if (!configured) return;
       const interval = process.env.NODE_ENV === "test" ? 200 : 15000;
       const jobs = db
         .prepare(
@@ -855,6 +876,7 @@ export function installYouTube({
           jobLocks.delete(job.id);
         }
       }
+      await cleanupCompleted();
     } finally {
       processing = false;
     }

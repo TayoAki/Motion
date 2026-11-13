@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -143,6 +143,11 @@ test(
               raw,
               "idempotent retries must use identical bytes",
             );
+            if (holdReplay) {
+              replayEntered();
+              await new Promise((resolve) => (releaseReplay = resolve));
+              if (res.destroyed) return;
+            }
             return json(res, { success: true, post: posts.get(saved.id) });
           }
           const body = JSON.parse(raw);
@@ -234,6 +239,11 @@ test(
     await once(finder, "listening");
     const port = finder.address().port;
     await new Promise((r) => finder.close(r));
+    let holdReplay = false,
+      replayEntered,
+      releaseReplay;
+    const replayReached = new Promise((resolve) => (replayEntered = resolve));
+    let configuredKey = "mock-outstand-only";
     let server,
       logs = "";
     async function start() {
@@ -246,7 +256,7 @@ test(
           PORT: String(port),
           APP_URL: `http://127.0.0.1:${port}`,
           MOTION_TEST_PROVIDER_ORIGIN: `http://127.0.0.1:${mock.address().port}`,
-          OUTSTAND_API_KEY: "mock-outstand-only",
+          OUTSTAND_API_KEY: configuredKey,
           OPENROUTER_API_KEY: "mock-ai-only",
           GOOGLE_CLIENT_ID: "",
           GOOGLE_CLIENT_SECRET: "",
@@ -277,6 +287,7 @@ test(
     }
     let sql;
     t.after(async () => {
+      releaseReplay?.();
       await stop();
       sql?.close();
       mock.closeAllConnections();
@@ -438,8 +449,27 @@ test(
         (r) => r.publications.find((p) => p.id === id)?.status === state,
         cookie,
       ).then((r) => r.publications.find((p) => p.id === id));
+    const publicationFile = (id) =>
+      sql.prepare("SELECT file FROM publications WHERE id=?").get(id).file;
+    async function removed(file) {
+      for (let i = 0; i < 150; i++) {
+        try {
+          await stat(file);
+        } catch (error) {
+          if (error.code === "ENOENT") return;
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.fail(`Publication copy was not removed: ${file}`);
+    }
     const job = await publish(p.body.id);
     await publication(job, "failed");
+    const cancelledCopy = publicationFile(job);
+    assert.ok(
+      (await stat(cancelledCopy)).size > 10000,
+      "recoverable failures retain the copied export",
+    );
     assert.equal(calls.creates, 1);
     assert.equal(calls.activations, 0);
     assert.equal(
@@ -463,6 +493,10 @@ test(
     assert.equal(calls.activations, 1);
     await api(`/youtube/publications/${job}/retry`, "POST", {}, cookie);
     const scheduled = await publication(job, "scheduled");
+    assert.ok(
+      (await stat(cancelledCopy)).size > 10000,
+      "pending schedules retain their recovery copy",
+    );
     assert.equal(scheduled.videoId, null);
     assert.equal(scheduled.privacy, "private");
     assert.equal(calls.creates, 1);
@@ -499,6 +533,12 @@ test(
       200,
     );
     await publication(job, "cancelled");
+    await removed(cancelledCopy);
+    assert.equal(publicationFile(job), null);
+    assert.ok(
+      (await stat(path.join(dataDir, rendered.file))).size > 10000,
+      "the original export remains available",
+    );
     assert.equal(posts.has(scheduled.postId), false);
     const instant = await publish(
       await readyProject("Unlisted immediate"),
@@ -508,6 +548,7 @@ test(
     const waiting = await publication(instant, "waiting");
     assert.equal(waiting.videoId, null);
     const immediatePost = posts.get(waiting.postId);
+    const publishedCopy = publicationFile(instant);
     assert.equal(immediatePost.request.youtube.privacyStatus, "unlisted");
     function delivered(post) {
       post.publishedAt = new Date().toISOString();
@@ -523,6 +564,8 @@ test(
         "https://www.youtube.com/watch?v=",
       ),
     );
+    await removed(publishedCopy);
+    assert.equal(publicationFile(instant), null);
     const failed = await publish(
         await readyProject("Quota failure"),
         "public",
@@ -555,6 +598,9 @@ test(
       cookie,
     );
     const balance = (await api("/me", "GET", null, cookie)).body.user.credits;
+    loseCreate = true;
+    const createsBeforeSeries = calls.creates,
+      putsBeforeSeries = calls.puts;
     const series = await api(
       "/series",
       "POST",
@@ -570,6 +616,59 @@ test(
       cookie,
     );
     assert.equal(series.status, 201);
+    const lostSeries = await waitFor(
+      "/series",
+      (r) =>
+        r.series.find((s) => s.id === series.body.id)?.runs[0]?.status ===
+        "failed",
+      cookie,
+    );
+    const lostRun = lostSeries.series.find((s) => s.id === series.body.id)
+      .runs[0];
+    const savedCreate = sql
+      .prepare(
+        "SELECT outstand_request,outstand_post_id FROM publications WHERE id=?",
+      )
+      .get(lostRun.publication_id);
+    assert.equal(savedCreate.outstand_post_id, null);
+    assert.equal(calls.creates, createsBeforeSeries + 1);
+    const requestedTime = future();
+    holdReplay = true;
+    assert.equal(
+      (
+        await api(
+          `/series/runs/${lostRun.id}/retry`,
+          "POST",
+          { publishAt: requestedTime },
+          cookie,
+        )
+      ).status,
+      200,
+    );
+    await Promise.race([
+      replayReached,
+      new Promise((_, reject) => {
+        const timer = setTimeout(
+          () =>
+            reject(
+              new Error("Recovery did not replay the original draft request"),
+            ),
+          3000,
+        );
+        timer.unref();
+      }),
+    ]);
+    // Crash after the new time is persisted, while the original draft replay is in flight.
+    assert.equal(
+      sql
+        .prepare("SELECT publish_at FROM publications WHERE id=?")
+        .get(lostRun.publication_id).publish_at,
+      requestedTime,
+    );
+    await stop();
+    holdReplay = false;
+    releaseReplay();
+    await start();
     const seriesState = await waitFor(
       "/series",
       (r) =>
@@ -582,6 +681,28 @@ test(
         await api("/youtube", "GET", null, cookie)
       ).body.publications.find((p) => p.id === run.publication_id);
     assert.equal(auto.privacy, "public");
+    assert.equal(auto.publishAt, requestedTime);
+    assert.equal(posts.get(auto.postId).scheduledAt, requestedTime);
+    assert.equal(
+      posts.get(auto.postId).request.scheduledAt,
+      JSON.parse(savedCreate.outstand_request).scheduledAt,
+    );
+    assert.equal(
+      sql
+        .prepare("SELECT outstand_request FROM publications WHERE id=?")
+        .get(run.publication_id).outstand_request,
+      savedCreate.outstand_request,
+    );
+    assert.equal(
+      calls.creates,
+      createsBeforeSeries + 1,
+      "recovery must reuse the original draft across a restart",
+    );
+    assert.equal(
+      calls.puts,
+      putsBeforeSeries + 1,
+      "recovery must reuse the uploaded media",
+    );
     assert.equal(
       (await api("/me", "GET", null, cookie)).body.user.credits,
       balance - 1,
@@ -666,13 +787,39 @@ test(
       502,
     );
     subscriptionMissing = false;
+    assert.equal(
+      (await api("/youtube/connection", "DELETE", null, cookie)).status,
+      200,
+    );
+    await stop();
+    // Simulate a crash after terminal state persistence but before file cleanup.
+    await copyFile(path.join(dataDir, rendered.file), publishedCopy);
+    sql
+      .prepare("UPDATE publications SET file=? WHERE id=?")
+      .run(publishedCopy, instant);
+    // Missing files must also be reconciled after a restart.
+    sql
+      .prepare("UPDATE publications SET file=? WHERE id=?")
+      .run(cancelledCopy, job);
     sql
       .prepare(
         "INSERT INTO publications(id,user_id,project_id,version,title,status,progress,created,updated) VALUES('legacy-google',?,'historic',1,'Old Google job','queued',0,?,?)",
       )
       .run(uid, new Date().toISOString(), new Date().toISOString());
-    await stop();
+    configuredKey = "";
     await start();
+    await removed(publishedCopy);
+    await waitFor(
+      "/youtube",
+      () => publicationFile(instant) === null && publicationFile(job) === null,
+      cookie,
+    );
+    assert.equal(
+      (await api("/health")).body.youtube,
+      false,
+      "cleanup must work without provider credentials",
+    );
+    assert.ok((await stat(path.join(dataDir, rendered.file))).size > 10000);
     assert.equal(
       (await api("/youtube", "GET", null, cookie)).body.publications.find(
         (p) => p.id === "legacy-google",
@@ -680,10 +827,6 @@ test(
       "blocked",
     );
     assert.equal(calls.google, 0);
-    assert.equal(
-      (await api("/youtube/connection", "DELETE", null, cookie)).status,
-      200,
-    );
     assert.equal(
       (await api("/youtube", "GET", null, cookie)).body.channel,
       null,
